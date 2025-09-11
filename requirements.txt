@@ -1,0 +1,31 @@
+# 固定 mitmproxy 稳定版本
+mitmproxy==9.0.1
+
+# 与 mitmproxy 9.0.1 匹配的依赖版本
+cryptography==38.0.4
+pyOpenSSL==22.1.0
+cffi==1.15.1
+pycparser==2.21
+
+# Brotli 支持（mitmproxy 需要）
+brotli==1.0.9
+brotlipy==0.7.0
+
+# 其他常用依赖
+six==1.16.0
+
+python -m pip install --upgrade pip wheel setuptools
+⚠️ 注意：
+
+这个命令必须在虚拟环境 已激活 的情况下运行。
+
+不要再用 pip install --upgrade ... 直接更新，否则会出现警告或者版本不一致。
+
+运行完之后，你就可以继续安装 mitmproxy 了：
+
+powershell
+复制
+编辑
+pip install mitmproxy==9.0.1
+pip install --force-reinstall --no-cache-dir zstandard==0.19.0
+mitmdump --version
