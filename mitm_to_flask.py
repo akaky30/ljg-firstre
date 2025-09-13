@@ -1,14 +1,25 @@
 # mitm_to_flask.py
 from mitmproxy import http
-import re, json, base64, threading, requests, os, time
+import re, json, base64, threading, requests, os, time, socket
 from datetime import datetime
 from collections import deque
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ---------- 配置 (可通过环境变量覆盖) ----------
-# 注意：将默认 FLASK_API_URL 改成你机器在局域网中的 IP（以便模拟器/设备能访问）
-API_URL = os.getenv("FLASK_API_URL", "http://172.20.10.4:5000/api/sessions")
+def get_local_ip():
+    """自动获取本机在当前网络下的局域网 IP"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # 这里并不会真的发请求，只是用来判断本机出口 IP
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    finally:
+        s.close()
+    return ip
+
+# 优先使用环境变量 FLASK_API_URL，否则动态获取 IP
+API_URL = os.getenv("FLASK_API_URL", f"http://{get_local_ip()}:5000/api/sessions")
 POST_INTERVAL = float(os.getenv("MITM_POST_INTERVAL", "0.12"))  # worker 每条之间的间隔 (秒)
 MAX_RETRIES = int(os.getenv("MITM_MAX_RETRIES", "3"))
 REQUEST_TIMEOUT = float(os.getenv("MITM_REQUEST_TIMEOUT", "5.0"))
@@ -155,4 +166,3 @@ def done():
     _stop_event.set()
     # 给 worker 短暂时间退出
     time.sleep(0.2)
-
