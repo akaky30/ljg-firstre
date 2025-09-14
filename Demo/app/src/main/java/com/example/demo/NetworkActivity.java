@@ -6,14 +6,23 @@ import android.widget.TextView;
 import androidx.appcompat.app.AppCompatActivity;
 
 import java.io.IOException;
+import java.util.Objects;
 
 import okhttp3.Call;
 import okhttp3.Callback;
 import okhttp3.CertificatePinner;
+import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
+import okhttp3.RequestBody;
 import okhttp3.Response;
 
+/**
+ * 进入页面后点击按钮：
+ * 1) 先发 GET（让 URL 日志模板看到）
+ * 2) 再发 POST，携带 body（让 RequestBody/base64 模板看到）
+ * 同时设置“错误的 pin”，便于验证 SSL Pinning Bypass。
+ */
 public class NetworkActivity extends AppCompatActivity {
 
     private TextView tv;
@@ -26,38 +35,71 @@ public class NetworkActivity extends AppCompatActivity {
         tv = findViewById(R.id.tvNetworkInfo);
         Button btn = findViewById(R.id.btnNetworkRequest);
 
-        btn.setOnClickListener(v -> doRequest());
+        btn.setOnClickListener(v -> doRequests());
     }
 
-    private void doRequest() {
-        // 故意设置一条“错误”的证书 pin：未绕过时应失败；
-        // 使用 Frida 的 SSL Pinning Bypass 模板后应能成功。
+    private OkHttpClient buildClientWithBadPin() {
         String host = "httpbin.org";
         CertificatePinner pinner = new CertificatePinner.Builder()
+                // 故意错误 pin：未绕过时应失败；绕过后成功
                 .add(host, "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
                 .build();
 
-        OkHttpClient client = new OkHttpClient.Builder()
+        return new OkHttpClient.Builder()
                 .certificatePinner(pinner)
                 .build();
+    }
 
-        Request req = new Request.Builder()
+    private void doRequests() {
+        OkHttpClient client = buildClientWithBadPin();
+
+        // -------- GET：触发 URL 日志 ----------
+        Request getReq = new Request.Builder()
                 .url(Config.API_BASE_URL + "/get")
                 .header("Authorization", TokenManager.getAuthorizationHeader())
                 .build();
 
-        tv.setText("Requesting " + req.url() + " ...");
+        tv.setText("GET " + getReq.url() + " ...\n");
 
-        client.newCall(req).enqueue(new Callback() {
+        client.newCall(getReq).enqueue(new Callback() {
             @Override public void onFailure(Call call, IOException e) {
                 runOnUiThread(() ->
-                        tv.setText("Request failed (expected before bypass):\n" + e));
+                        tv.append("GET failed (expected before pin-bypass):\n" + e + "\n\n"));
             }
 
             @Override public void onResponse(Call call, Response response) throws IOException {
                 String body = response.body() != null ? response.body().string() : "(no body)";
                 runOnUiThread(() ->
-                        tv.setText("Request succeeded (after bypass):\n" + body));
+                        tv.append("GET succeeded (after bypass):\n" + body + "\n\n"));
+                response.close();
+            }
+        });
+
+        // -------- POST：触发 RequestBody/base64 ----------
+        MediaType form = MediaType.parse("application/x-www-form-urlencoded");
+        String formText = "msg=" + CryptoHelper.b64encode("hi-frida")
+                + "&jwt=" + TokenManager.getJwt();
+
+        RequestBody postBody = RequestBody.create(formText, form);
+
+        Request postReq = new Request.Builder()
+                .url(Config.API_BASE_URL + "/post")
+                .post(postBody)
+                .build();
+
+        tv.append("POST " + postReq.url() + " ...\n");
+
+        client.newCall(postReq).enqueue(new Callback() {
+            @Override public void onFailure(Call call, IOException e) {
+                runOnUiThread(() ->
+                        tv.append("POST failed (expected before pin-bypass):\n" + e + "\n"));
+            }
+
+            @Override public void onResponse(Call call, Response response) throws IOException {
+                String body = response.body() != null ? response.body().string() : "(no body)";
+                runOnUiThread(() ->
+                        tv.append("POST succeeded (after bypass):\n" + body + "\n"));
+                response.close();
             }
         });
     }

@@ -6,6 +6,10 @@ import android.widget.Button;
 import android.widget.TextView;
 import androidx.appcompat.app.AppCompatActivity;
 
+/**
+ * 写入 + 读取 SharedPreferences。
+ * 模板会 hook getString(...) 并打印 key/value。
+ */
 public class PrefsActivity extends AppCompatActivity {
 
     private static final String PREFS = "demo_prefs";
@@ -18,7 +22,7 @@ public class PrefsActivity extends AppCompatActivity {
 
         tv = findViewById(R.id.tvPrefsInfo);
         Button btnWrite = findViewById(R.id.btnPrefsWrite);
-        Button btnRead = findViewById(R.id.btnPrefsRead);
+        Button btnRead  = findViewById(R.id.btnPrefsRead);
 
         btnWrite.setOnClickListener(v -> writePrefs());
         btnRead.setOnClickListener(v -> readPrefs());

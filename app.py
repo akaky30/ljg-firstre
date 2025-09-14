@@ -236,195 +236,197 @@ def export_sessions():
         return si.getvalue(), 200, {'Content-Type':'text/csv; charset=utf-8','Content-Disposition':'attachment; filename="sessions.csv"'}
     return jsonify(data)
 
-# ------------------ FRIDA templates & helpers ------------------
+# ------------------ FRIDA templates & helpers (safe for .format) ------------------
 FRIDA_TEMPLATES = {
-  # 0) 运行环境探针（确认 Java 是否可用 & 打几个环境点）
-  "runtime_probe": r"""
-(function(){
-  function log(){ try{ send({__frida_console:true, args:[].map.call(arguments, x=>''+x)});}catch(e){} }
-  try { log('[probe] Java.available =', (typeof Java!=='undefined')? Java.available:false); } catch(e){ log('[probe] err', e); }
-  try {
-    var mods = Process.enumerateModulesSync().slice(0,50).map(m=>m.name);
+    # 0) 运行环境探针：确认 Java 可用 & 打点
+    "runtime_probe": r"""
+(function(){{
+  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
+  try {{ log('[probe] Java.available =', (typeof Java!=='undefined')? Java.available:false); }} catch(e){{ log('[probe] err', e); }}
+  try {{
+    var mods = Process.enumerateModulesSync().slice(0,50).map(function(m){{return m.name;}});
     log('[probe-modules]', mods.join(', '));
-  } catch(e){}
-})();
+  }} catch(e){{}}
+}})();
 """,
 
-  # 1) OkHttp：打印请求 URL + 请求体（base64）
-  "okhttp_log_url": r"""
-Java.perform(function(){
-  function log(){ try{ send({__frida_console:true, args:[].map.call(arguments, x=>''+x)});}catch(e){} }
-  try {
+    # 1) OkHttp：打印请求 URL + 请求体（base64）
+    "okhttp_log_url": r"""
+Java.perform(function(){{
+  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
+  try {{
     var OkHttpClient = Java.use('okhttp3.OkHttpClient');
     var Buffer = Java.use('okio.Buffer');
     var Base64 = Java.use('android.util.Base64');
     var newCall_over = OkHttpClient.newCall.overload('okhttp3.Request');
 
-    newCall_over.implementation = function(request){
-      try {
-        var url = "(unknown)"; try { url = request.url().toString(); } catch(e){}
+    newCall_over.implementation = function(request){{
+      try {{
+        var url = "(unknown)"; try {{ url = request.url().toString(); }} catch(e){{}}
         log('[okhttp hook] url=', url);
-        try {
+        try {{
           var body = request.body();
-          if (body) {
+          if (body) {{
             var buf = Buffer.$new();
             body.writeTo(buf);
             var bytes = buf.readByteArray();
             log('[okhttp hook][body][base64]', Base64.encodeToString(bytes, 0));
-          }
-        } catch(e){}
+          }} else {{
+            log('[okhttp hook] no body');
+          }}
+        }} catch(e){{ log('[okhttp hook] read body err:', e); }}
         return newCall_over.call(this, request);
-      } catch(inner){
-        try { return newCall_over.call(this, request); } catch(e){ return this.newCall(request); }
-      }
-    };
+      }} catch(inner){{
+        try {{ return newCall_over.call(this, request); }} catch(e){{ return this.newCall(request); }}
+      }}
+    }};
     log('[okhttp hook] installed');
-  } catch(e){
+  }} catch(e){{
     log('[okhttp hook] install failed:', e);
-  }
-});
+  }}
+}});
 """,
 
-  # 2) OkHttp：在 RequestBody.writeTo 处抓包（base64）
-  "requestbody_dump": r"""
-Java.perform(function() {
-  function log(){ try{ send({__frida_console:true, args:[].map.call(arguments, x=>''+x)});}catch(e){} }
-  try {
+    # 2) OkHttp：在 RequestBody.writeTo 处抓包（base64）
+    "requestbody_dump": r"""
+Java.perform(function() {{
+  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
+  try {{
     var RequestBody = Java.use("okhttp3.RequestBody");
     var Buffer = Java.use("okio.Buffer");
     var Base64 = Java.use("android.util.Base64");
     var writeToOver = RequestBody.writeTo.overload("okio.BufferedSink");
 
-    writeToOver.implementation = function(sink) {
-      try {
+    writeToOver.implementation = function(sink) {{
+      try {{
         var buf = Buffer.$new();
         writeToOver.call(this, buf);           // 先写到内存
         var bytes = buf.readByteArray();
         log("[RequestBody] base64:", Base64.encodeToString(bytes, 0));
-      } catch(e) { log("RB err:", e); }
+      }} catch(e) {{ log("RB err:", e); }}
       return writeToOver.call(this, sink);     // 再写回真实 sink
-    };
+    }};
     log("[RequestBody] hook installed");
-  } catch(e) { log("RequestBody hook fail", e); }
-});
+  }} catch(e) {{ log("RequestBody hook fail", e); }}
+}});
 """,
 
-  # 3) SSL Pinning Bypass（OkHttp + Hostname + 全局 TrustManager + HttpsURLConnection 兜底）
-  "ssl_pinning_bypass": r"""
-Java.perform(function() {
-  function log(){ try{ send({__frida_console:true, args:[].map.call(arguments, x=>''+x)});}catch(e){} }
+    # 3) SSL Pinning Bypass（OkHttp + Hostname + TrustManager + HttpsURLConnection 兜底）
+    "ssl_pinning_bypass": r"""
+Java.perform(function() {{
+  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
 
   // 3.1 OkHttp CertificatePinner.check 全覆盖
-  try {
+  try {{
     var CertPinner = Java.use('okhttp3.CertificatePinner');
-    if (CertPinner.check) {
-      CertPinner.check.overloads.forEach(function(ov, idx){
-        ov.implementation = function(){ log('[bypass] CertificatePinner.check #'+idx+' -> bypass'); return; };
-      });
-    }
-    if (CertPinner['check$okhttp']) {
-      CertPinner['check$okhttp'].overloads.forEach(function(ov, idx){
-        ov.implementation = function(){ log('[bypass] CertificatePinner.check$okhttp #'+idx+' -> bypass'); return; };
-      });
-    }
-  } catch(e){ log('[bypass] CertPinner hook failed:', e); }
+    if (CertPinner.check) {{
+      CertPinner.check.overloads.forEach(function(ov, idx){{
+        ov.implementation = function(){{ log('[bypass] CertificatePinner.check #'+idx+' -> bypass'); return; }};
+      }});
+    }}
+    if (CertPinner['check$okhttp']) {{
+      CertPinner['check$okhttp'].overloads.forEach(function(ov, idx){{
+        ov.implementation = function(){{ log('[bypass] CertificatePinner.check$okhttp #'+idx+' -> bypass'); return; }};
+      }});
+    }}
+  }} catch(e){{ log('[bypass] CertPinner hook failed:', e); }}
 
   // 3.2 Hostname 验证兜底
-  try {
+  try {{
     var OkHostnameVerifier = Java.use('okhttp3.internal.tls.OkHostnameVerifier');
-    if (OkHostnameVerifier && OkHostnameVerifier.verify) {
-      OkHostnameVerifier.verify.overloads.forEach(function(ov){
-        ov.implementation = function(host, session){ log('[bypass] OkHostnameVerifier.verify host='+host+' -> true'); return true; };
-      });
-    }
-  } catch(e){ log('[bypass] OkHostnameVerifier hook failed:', e); }
+    if (OkHostnameVerifier && OkHostnameVerifier.verify) {{
+      OkHostnameVerifier.verify.overloads.forEach(function(ov){{
+        ov.implementation = function(host, session){{ log('[bypass] OkHostnameVerifier.verify host='+host+' -> true'); return true; }};
+      }});
+    }}
+  }} catch(e){{ log('[bypass] OkHostnameVerifier hook failed:', e); }}
 
   // 3.3 全局 TrustManager（替换 SSLContext.init）
-  try {
+  try {{
     var X509TM = Java.use('javax.net.ssl.X509TrustManager');
     var SSLContext = Java.use('javax.net.ssl.SSLContext');
 
-    var TrustAll = Java.registerClass({
+    var TrustAll = Java.registerClass({{
       name: 'org.frida.TrustAllManager',
       implements: [X509TM],
-      methods: {
-        checkClientTrusted: function(chain, authType) {},
-        checkServerTrusted: function(chain, authType) {},
-        getAcceptedIssuers: function() { return []; }
-      }
-    });
+      methods: {{
+        checkClientTrusted: function(chain, authType) {{}},
+        checkServerTrusted: function(chain, authType) {{}},
+        getAcceptedIssuers: function() {{ return []; }}
+      }}
+    }});
 
     var initOver = SSLContext.init.overload('[Ljavax.net.ssl.KeyManager;','[Ljavax.net.ssl.TrustManager;','java.security.SecureRandom');
-    initOver.implementation = function(km, tm, sr){
+    initOver.implementation = function(km, tm, sr){{
       log('[bypass] SSLContext.init -> replace TrustManager');
       return initOver.call(this, km, [TrustAll.$new()], sr);
-    };
-  } catch(e){ log('[bypass] SSLContext hook failed:', e); }
+    }};
+  }} catch(e){{ log('[bypass] SSLContext hook failed:', e); }}
 
   // 3.4 HttpsURLConnection 兜底
-  try {
+  try {{
     var HUC = Java.use('javax.net.ssl.HttpsURLConnection');
-    HUC.setDefaultHostnameVerifier.implementation = function(verifier){
+    HUC.setDefaultHostnameVerifier.implementation = function(verifier){{
       log('[bypass] HttpsURLConnection.setDefaultHostnameVerifier ignored');
       return; // 丢弃外部设置
-    };
-  } catch(e){}
-});
+    }};
+  }} catch(e){{}}
+}});
 """,
 
-  # 4) SharedPreferences Dump（读全打印 + Editor 写路径打印）
-  "sharedprefs_dump": r"""
-Java.perform(function() {
-  function log(){ try{ send({__frida_console:true, args:[].map.call(arguments, x=>''+x)});}catch(e){} }
-  try {
+    # 4) SharedPreferences Dump（读全打印 + Editor 写路径打印）
+    "sharedprefs_dump": r"""
+Java.perform(function() {{
+  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
+  try {{
     var SPImpl = Java.use('android.app.SharedPreferencesImpl');
     var EditorImpl = Java.use('android.app.SharedPreferencesImpl$EditorImpl');
 
-    function whichFile(sp) {
-      try {
+    function whichFile(sp) {{
+      try {{
         var f = sp.getClass().getDeclaredField('mFile');
         f.setAccessible(true);
         var file = f.get(sp);
         return file ? file.getAbsolutePath() : '(unknown-file)';
-      } catch(e) { return '(unknown-file)'; }
-    }
+      }} catch(e) {{ return '(unknown-file)'; }}
+    }}
 
-    if (SPImpl.getAll) {
+    if (SPImpl.getAll) {{
       var getAll = SPImpl.getAll.overload();
-      getAll.implementation = function() {
+      getAll.implementation = function() {{
         var ret = getAll.call(this);
-        try { log('[SharedPreferences][getAll] file=', whichFile(this), ' -> ', ret.toString()); } catch(e){}
+        try {{ log('[SharedPreferences][getAll] file=', whichFile(this), ' -> ', ret.toString()); }} catch(e){{}}
         return ret;
-      };
-    }
-    if (SPImpl.getString) {
+      }};
+    }}
+    if (SPImpl.getString) {{
       var getStr = SPImpl.getString.overload('java.lang.String','java.lang.String');
-      getStr.implementation = function(key, def) {
+      getStr.implementation = function(key, def) {{
         var v = getStr.call(this, key, def);
-        try { log('[SharedPreferences][getString] file=', whichFile(this), ' ', key, ' = ', v); } catch(e){}
+        try {{ log('[SharedPreferences][getString] file=', whichFile(this), ' ', key, ' = ', v); }} catch(e){{}}
         return v;
-      };
-    }
+      }};
+    }}
 
-    function hookEditor(name, sig) {
-      try {
+    function hookEditor(name, sig) {{
+      try {{
         var ov = EditorImpl[name].overload.apply(EditorImpl[name], sig);
-        ov.implementation = function() {
-          try {
-            if (name.startsWith('put')) {
+        ov.implementation = function() {{
+          try {{
+            if (name.startsWith('put')) {{
               log('[SharedPreferences][Editor.'+name+']', arguments[0], '=', arguments[1]);
-            } else if (name === 'remove') {
+            }} else if (name === 'remove') {{
               log('[SharedPreferences][Editor.remove] key=', arguments[0]);
-            } else if (name === 'clear') {
+            }} else if (name === 'clear') {{
               log('[SharedPreferences][Editor.clear]');
-            } else if (name === 'apply' || name === 'commit') {
+            }} else if (name === 'apply' || name === 'commit') {{
               log('[SharedPreferences][Editor.'+name+']');
-            }
-          } catch(e){}
+            }}
+          }} catch(e){{}}
           return ov.apply(this, arguments);
-        };
-      } catch(e){}
-    }
+        }};
+      }} catch(e){{}}
+    }}
 
     hookEditor('putString', ['java.lang.String','java.lang.String']);
     hookEditor('putInt', ['java.lang.String','int']);
@@ -437,118 +439,120 @@ Java.perform(function() {
     hookEditor('commit', []);
 
     log('[SharedPreferences] hooks installed');
-  } catch(e) { log('sharedprefs_dump err:', e); }
-});
+  }} catch(e) {{ log('sharedprefs_dump err:', e); }}
+}});
 """,
 
-  # 5) Dump class string fields（需类名；静态 + 实例；自动挑 Loader；无实例也会提示）
-  "dump_class_string_fields": r"""
-Java.perform(function () {
-  function log(){ try{ send({__frida_console:true, args:[].map.call(arguments, x=>''+x)});}catch(e){} }
+    # 5) Dump class string fields（静态 + 实例；自动挑 Loader）。需要传入 class_name
+    "dump_class_string_fields": r"""
+Java.perform(function () {{
+  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
 
   var clsName = "{class_name}";
   log("[dump] target class:", clsName);
 
   // 5.1 选择能加载该类的 ClassLoader
-  try {
+  try {{
     var loaders = Java.enumerateClassLoadersSync();
     var picked = null;
-    for (var i = 0; i < loaders.length; i++) {
+    for (var i = 0; i < loaders.length; i++) {{
       var L = loaders[i];
-      try { if (L.findClass && L.findClass(clsName)) { picked = L; break; } } catch(_){}
-      try { if (L.loadClass && L.loadClass(clsName, false)) { picked = L; break; } } catch(_){}
-    }
-    if (picked) { Java.classFactory.loader = picked; log("[dump] picked loader:", picked.$className || picked.toString()); }
-  } catch(e){}
+      try {{ if (L.findClass && L.findClass(clsName)) {{ picked = L; break; }} }} catch(_){{
+      }}
+      try {{ if (L.loadClass && L.loadClass(clsName, false)) {{ picked = L; break; }} }} catch(_){{
+      }}
+    }}
+    if (picked) {{ Java.classFactory.loader = picked; log("[dump] picked loader:", picked.$className || picked.toString()); }}
+  }} catch(e){{}}
 
   // 5.2 打印静态 String 字段
   var staticOK = false;
-  try {
+  try {{
     var Clz = Java.use(clsName);
     var Modifier = Java.use("java.lang.reflect.Modifier");
     var fields = Clz.class.getDeclaredFields();
-    for (var i = 0; i < fields.length; i++) {
-      try {
+    for (var i = 0; i < fields.length; i++) {{
+      try {{
         var f = fields[i]; f.setAccessible(true);
-        if (Modifier.isStatic(f.getModifiers()) && f.getType().getName() === "java.lang.String") {
+        if (Modifier.isStatic(f.getModifiers()) && f.getType().getName() === "java.lang.String") {{
           var val = f.get(null);
           log("[DUMP][static]", clsName + "." + f.getName(), "=", val);
           staticOK = true;
-        }
-      } catch (eF) {}
-    }
-  } catch (eClz) {
+        }}
+      }} catch (eF) {{}}
+    }}
+  }} catch (eClz) {{
     log("[dump] ERROR: cannot use class:", eClz);
-  }
+  }}
   if (!staticOK) log("[dump] no static String fields or not accessible");
 
   // 5.3 枚举实例并打印实例字段
   var found = false;
-  Java.choose(clsName, {
-    onMatch: function (inst) {
+  Java.choose(clsName, {{
+    onMatch: function (inst) {{
       found = true;
-      try {
+      try {{
         var flds = inst.getClass().getDeclaredFields();
         var Modifier = Java.use('java.lang.reflect.Modifier');
-        for (var i = 0; i < flds.length; i++) {
-          try {
+        for (var i = 0; i < flds.length; i++) {{
+          try {{
             flds[i].setAccessible(true);
             if (flds[i].getType().getName() === "java.lang.String"
-                && !Modifier.isStatic(flds[i].getModifiers())) {
+                && !Modifier.isStatic(flds[i].getModifiers())) {{
               var v = flds[i].get(inst);
               log("[DUMP][instance]", clsName + "#" + flds[i].getName(), "=", v);
-            }
-          } catch (e1) {}
-        }
-      } catch (e2) {}
-    },
-    onComplete: function () { if (!found) log("[dump] no instance found for", clsName); log("[dump] choose complete for", clsName); }
-  });
-});
+            }}
+          }} catch (e1) {{}}
+        }}
+      }} catch (e2) {{}}
+    }},
+    onComplete: function () {{ if (!found) log("[dump] no instance found for", clsName); log("[dump] choose complete for", clsName); }}
+  }});
+}});
 """,
 
-  # 6) 搜索所有类的静态 String 中的 JWT（含 Base64 解码尝试）
-  "search_jwt_in_static_strings": r"""
-Java.perform(function() {
-  function log(){ try{ send({__frida_console:true, args:[].map.call(arguments, x=>''+x)});}catch(e){} }
+    # 6) 搜索所有类的静态 String 中的 JWT（含 Base64 解码尝试）
+    "search_jwt_in_static_strings": r"""
+Java.perform(function() {{
+  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
 
   // 尝试锁定 App 的 ClassLoader（通过 BuildConfig）
-  try {
+  try {{
     var app = Java.use('android.app.ActivityThread').currentApplication();
-    if (app) {
+    if (app) {{
       var pkg = app.getApplicationContext().getPackageName();
       var buildCfg = pkg + ".BuildConfig";
       var loaders = Java.enumerateClassLoadersSync();
-      for (var i=0;i<loaders.length;i++){
-        try { if (loaders[i].loadClass(buildCfg)) { Java.classFactory.loader = loaders[i]; log('[search_jwt] set loader by BuildConfig'); break; } } catch(e){}
-      }
-    }
-  } catch(e){}
+      for (var i=0;i<loaders.length;i++){{ 
+        try {{ if (loaders[i].loadClass(buildCfg)) {{ Java.classFactory.loader = loaders[i]; log('[search_jwt] set loader by BuildConfig'); break; }} }} catch(e){{}} 
+      }}
+    }}
+  }} catch(e){{}}
 
   var JWT_RE_GLOBAL = /[A-Za-z0-9\-_]+?\.[A-Za-z0-9\-_]+?\.[A-Za-z0-9\-_]+/g;
   var JWT_RE_STRICT = /^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$/;
 
-  function toJsString(v){ try { return (v===null||v===undefined) ? "" : (""+v); } catch(e){ return ""; } }
-  function tryBase64Decode(s){
-    try {
+  function toJsString(v){{ try {{ return (v===null||v===undefined) ? "" : (""+v); }} catch(e){{ return ""; }} }}
+  function tryBase64Decode(s){{
+    try {{
       var Base64 = Java.use('android.util.Base64');
       var bytes = Base64.decode(s, 0);
       var JStr = Java.use('java.lang.String');
       return JStr.$new(bytes).toString();
-    } catch(e){ return ""; }
-  }
+    }} catch(e){{ return ""; }}
+  }}
 
   var Modifier = Java.use('java.lang.reflect.Modifier');
   var classes = Java.enumerateLoadedClassesSync();
   log("[search_jwt] loaded classes:", classes.length);
 
-  for (var i=0;i<classes.length;i++){
+  for (var i=0;i<classes.length;i++){{ 
     var name = classes[i];
-    try {
+    try {{
       var C = Java.use(name);
       var fields = C.class.getDeclaredFields();
-      for (var j=0;j<fields.length;j++){
-        try {
+      for (var j=0;j<fields.length;j++){{ 
+        try {{
           var f = fields[j]; f.setAccessible(true);
           if (!Modifier.isStatic(f.getModifiers())) continue;
           if (f.getType().getName() !== "java.lang.String") continue;
@@ -556,32 +560,32 @@ Java.perform(function() {
           var val = toJsString(f.get(null));
           if (!val) continue;
 
-          if (JWT_RE_STRICT.test(val)) {
+          if (JWT_RE_STRICT.test(val)) {{
             log("[JWT static] class=", name, " field=", f.getName(), " value=", val);
             continue;
-          }
+          }}
           var m = val.match(JWT_RE_GLOBAL);
-          if (m && m.length) {
-            m.forEach(function(tok){ log("[JWT static(sub)] class=", name, " field=", f.getName(), " value=", tok); });
+          if (m && m.length) {{
+            m.forEach(function(tok){{ log("[JWT static(sub)] class=", name, " field=", f.getName(), " value=", tok); }});
             continue;
-          }
+          }}
           var dec = tryBase64Decode(val);
-          if (dec) {
-            if (JWT_RE_STRICT.test(dec)) {
+          if (dec) {{
+            if (JWT_RE_STRICT.test(dec)) {{
               log("[JWT static][b64] class=", name, " field=", f.getName(), " value=", dec);
               continue;
-            }
+            }}
             var m2 = dec.match(JWT_RE_GLOBAL);
-            if (m2 && m2.length) {
-              m2.forEach(function(tok){ log("[JWT static(sub)][b64] class=", name, " field=", f.getName(), " value=", tok); });
-            }
-          }
-        } catch(ef) {}
-      }
-    } catch(ec) {}
-  }
+            if (m2 && m2.length) {{
+              m2.forEach(function(tok){{ log("[JWT static(sub)][b64] class=", name, " field=", f.getName(), " value=", tok); }});
+            }}
+          }}
+        }} catch(ef) {{}}
+      }}
+    }} catch(ec) {{}}
+  }}
   log("[search_jwt] done.");
-});
+}});
 """
 }
 
