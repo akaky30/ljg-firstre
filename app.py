@@ -67,6 +67,35 @@ SENSITIVE_PATTERNS = {
     "password": re.compile(r"(?i)password[\"'=:\s]*([^&\s]+)")
 }
 
+def pick_exact_pid_from_ps(ps_output: str, target_app: str):
+    """
+    从 frida-ps -Uai 的输出里，尽量选主进程 PID：
+    - 优先匹配整行末尾恰好是 target_app 的行（避免 :push / :remote）
+    - 再退而求其次匹配“最后一列等于 target_app”的行
+    返回 int 或 None
+    """
+    best = None
+    for ln in (ps_output or "").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        parts = s.split()
+        # 先判定是否匹配“恰好就是包名（无冒号后缀）”
+        if s.endswith(" " + target_app) or s.endswith("\t" + target_app) or (len(parts) >= 2 and parts[-1] == target_app):
+            # 抓第一个纯数字 token 当 PID
+            for tok in parts:
+                if tok.isdigit():
+                    return int(tok)
+
+        # 记录一个退路：包含 target_app 但不是严格等于（比如 :remote），仅在完全找不到时用
+        if target_app in s and best is None:
+            for tok in parts:
+                if tok.isdigit():
+                    best = int(tok)
+                    break
+    return best
+
+
 def detect_sensitive(text: str) -> list:
     if not text:
         return []
@@ -773,13 +802,38 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn):
     """
     Synchronous attach/spawn + create/load script using frida-python.
     Returns dict {status/pid/script/...} - pid is real number when ok.
-    This enhanced version will automatically load a fallback "wait-for-Java" wrapper
-    if the first script throws a ReferenceError about Java being undefined.
+    Auto-load a wait-for-Java wrapper if Java is undefined.
     """
     if not FRIDA_PY_AVAILABLE:
-        return {"error":"frida python module not available"}
+        return {"error": "frida python module not available"}
 
-    # ensure console wrapper is present for API path too
+    def _pidof_exact(package: str):
+        try:
+            p = subprocess.run(["adb", "shell", "pidof", "-s", package], capture_output=True, text=True, timeout=4)
+            out = (p.stdout or "").strip()
+            if out and out.split()[0].isdigit():
+                return int(out.split()[0])
+        except Exception:
+            pass
+        return None
+
+    def _pick_exact_pid_from_ps(ps_out: str, package: str):
+        for ln in (ps_out or "").splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            if not s.endswith(f" {package}") and not s.endswith(f"\t{package}") and not s.endswith(package):
+                continue
+            toks = s.split()
+            for tok in toks:
+                if tok.isdigit():
+                    return int(tok)
+        return None
+
+    # 小工具：兼容 session.pid / session._pid
+    def _get_session_pid(session):
+        return getattr(session, "pid", getattr(session, "_pid", None))
+
     final_script = CONSOLE_WRAPPER + "\n" + script_text
 
     try:
@@ -792,45 +846,40 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn):
         pid = None
 
         if use_spawn:
+            socketio.emit("frida_log", {"pid": -1, "line": f"[api] spawn {target_app} ..."})
             spawned_pid = device.spawn([target_app])
             pid = spawned_pid
-            # Resume first so process finishes startup; then attach so script executes after normal init
+            session = device.attach(pid)
             try:
                 device.resume(pid)
             except Exception:
                 pass
-            # small delay to let resumed process proceed
-            time.sleep(0.05)
-            session = device.attach(pid)
+            time.sleep(0.8)
+            socketio.emit("frida_log", {"pid": pid, "line": f"[api] spawn attached pid={pid}, resumed, waiting-for-Java..."})
         else:
-            try:
-                # allow attaching by name or pid (frida API accepts pid int)
-                session = device.attach(target_app)
-                pid = session.pid
-            except Exception as e_attach:
-                # try to attach by pid parsed from frida-ps output
+            exact_pid = _pidof_exact(target_app)
+            if exact_pid is None:
                 try:
                     p = subprocess.run(["frida-ps", "-Uai"], capture_output=True, text=True, timeout=5)
                     if p.returncode == 0:
-                        for ln in (p.stdout or "").splitlines():
-                            if target_app in ln:
-                                for tok in ln.split():
-                                    if tok.isdigit():
-                                        possible_pid = int(tok)
-                                        session = device.attach(possible_pid)
-                                        pid = possible_pid
-                                        break
-                                if session:
-                                    break
+                        exact_pid = _pick_exact_pid_from_ps(p.stdout, target_app)
                 except Exception:
-                    pass
-                if session is None:
-                    raise RuntimeError(f"attach failed: {e_attach}")
+                    exact_pid = None
+
+            try:
+                if exact_pid is not None:
+                    socketio.emit("frida_log", {"pid": -1, "line": f"[api] attach by PID {exact_pid} ({target_app})"})
+                    session = device.attach(exact_pid)
+                    pid = exact_pid
+                else:
+                    socketio.emit("frida_log", {"pid": -1, "line": f"[api] attach by NAME {target_app}"})
+                    session = device.attach(target_app)
+                    pid = _get_session_pid(session)
+            except Exception as e_attach:
+                raise RuntimeError(f"attach failed: {e_attach}")
 
         # create script + message handler
         script = session.create_script(final_script)
-
-        # context to allow on_message to inject fallback only once
         ctx = {"fallback_injected": False}
 
         def on_message(message, data):
@@ -845,7 +894,6 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn):
                 elif mtype == "error":
                     stack = message.get("stack") or message.get("description") or str(message)
                     socketio.emit("frida_log", {"pid": pid, "line": "[JS ERROR]\n" + str(stack)})
-                    # detect ReferenceError about Java and inject fallback wrapper once
                     try:
                         s = str(stack)
                         if ("Java" in s or "java" in s) and ("not defined" in s or "ReferenceError" in s) and not ctx["fallback_injected"]:
@@ -867,31 +915,30 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn):
 
         script.on("message", on_message)
 
-        # load script (synchronous)
         try:
             script.load()
         except Exception as e_load:
             socketio.emit("frida_log", {"pid": pid or -1, "line": "[script.load error] " + str(e_load)})
             raise
 
-        # store references to avoid GC
         with FRIDA_SESSIONS_LOCK:
             FRIDA_SESSIONS[pid] = {"session": session, "script": script, "device": device, "target": target_app}
 
         socketio.emit("frida_started", {"pid": pid, "script": f"(in-memory script for {target_app})", "spawn": use_spawn})
         logging.info("Started frida (api) pid=%s spawn=%s target=%s", pid, use_spawn, target_app)
-        return {"status":"ok", "pid": pid, "script": f"(in-memory script for {target_app})", "spawn": use_spawn}
+        return {"status": "ok", "pid": pid, "script": f"(in-memory script for {target_app})", "spawn": use_spawn}
     except frida.TransportError as te:
         logging.error("frida transport error: %s", te)
         socketio.emit("frida_log", {"pid": pid or -1, "line": f"[frida transport error] {te}"})
-        return {"error":"frida api error", "detail": str(te)}
+        return {"error": "frida api error", "detail": str(te)}
     except Exception as e:
         logging.error("frida api error: %s\n%s", e, traceback.format_exc())
-        return {"error":"frida api error", "detail": str(e)}
+        return {"error": "frida api error", "detail": str(e)}
 
 
 # ------------------ Consolidated wait-wrapper with improved diagnostics ------------------
-def wrap_user_script_wait_java(user_js: str, max_attempts: int = 150, delay_ms: int = 100):
+def wrap_user_script_wait_java(user_js: str, max_attempts: int = 50, delay_ms: int = 100):
+
     """
     Robust wrapper: waits for Java (using Java.available when possible). On timeout it
     emits detailed diagnostics (modules list, ranges count) and attempts a final
@@ -964,8 +1011,8 @@ def wrap_user_script_wait_java(user_js: str, max_attempts: int = 150, delay_ms: 
 
 }})();
 """
-    return tpl
 
+    return tpl
 @app.route('/api/run_frida', methods=['POST'])
 @require_token
 def run_frida():
@@ -978,103 +1025,161 @@ def run_frida():
     script_override = data.get("script")
 
     if not target_app:
-        return jsonify({"error":"Missing target app"}), 400
+        return jsonify({"error": "Missing target app"}), 400
 
+    # 1) 生成脚本（渲染模板 + 等待 Java 的包裹）
     try:
         if script_override:
             frida_script = script_override
         elif template_name:
             tpl = FRIDA_TEMPLATES.get(template_name)
             if not tpl:
-                return jsonify({"error":"template not found"}), 404
+                return jsonify({"error": "template not found"}), 404
             frida_script = safe_format(tpl, **params)
         elif session_id:
             conn = db_conn()
             row = conn.execute("SELECT url, headers, body FROM sessions WHERE id=?", (session_id,)).fetchone()
             conn.close()
             if not row:
-                return jsonify({"error":"Session not found"}), 404
+                return jsonify({"error": "Session not found"}), 404
             url = row[0]; body = row[2]
-            base_tpl = FRIDA_TEMPLATES.get("requestbody_dump") if (body and len(body.strip())>0) else FRIDA_TEMPLATES.get("okhttp_log_url")
+            base_tpl = FRIDA_TEMPLATES.get("requestbody_dump") if (body and len(body.strip()) > 0) else FRIDA_TEMPLATES.get("okhttp_log_url")
             frida_script = safe_format(base_tpl, url=url)
         else:
             frida_script = FRIDA_TEMPLATES.get("okhttp_log_url")
     except Exception as e:
         logging.error("prepare script failed: %s", traceback.format_exc())
-        return jsonify({"error":"prepare script failed", "detail": str(e)}), 500
+        return jsonify({"error": "prepare script failed", "detail": str(e)}), 500
 
-    # wrap the script to wait for Java (do NOT include console wrapper here; API path will prepend it)
     wrapped_no_console = wrap_user_script_wait_java(frida_script)
 
-    # persist script to file (for subprocess fallback) -- for CLI we must include CONSOLE_WRAPPER so stdout sends will be visible
+    # 2) 写一份到磁盘（CLI 回退用，带 console wrapper）
     script_name = f"frida_{session_id or 'manual'}_{int(time.time())}.js"
     script_path = os.path.join(FRIDA_DIR, script_name)
     try:
         with open(script_path, "w", encoding="utf-8") as f:
-            # CLI expects console wrapper + wrapped script
             f.write(CONSOLE_WRAPPER + "\n" + wrapped_no_console)
     except Exception as e:
-        return jsonify({"error":"write script failed", "detail": str(e)}), 500
+        return jsonify({"error": "write script failed", "detail": str(e)}), 500
 
-    # Preferred path: frida python API (synchronous)
+    # ---- helpers（仅本函数内使用）----
+    def _pidof_exact(package: str):
+        """优先用 adb pidof 精确拿主进程 PID。"""
+        try:
+            p = subprocess.run(["adb", "shell", "pidof", "-s", package],
+                               capture_output=True, text=True, timeout=4)
+            out = (p.stdout or "").strip()
+            if out and out.split()[0].isdigit():
+                return int(out.split()[0])
+        except Exception:
+            pass
+        return None
+
+    def _pick_from_frida_ps(package: str):
+        """
+        从 `frida-ps -Uai` 输出中，找到 Identifier==package 那一行，
+        返回 (pid, name)；其中 name 是你 CLI 用的 -n 名称（如 “Demo”）。
+        """
+        try:
+            ps = subprocess.run(["frida-ps", "-Uai"], capture_output=True, text=True, timeout=6)
+            if ps.returncode != 0:
+                return (None, None, ps.stdout or "", ps.stderr or "")
+            for ln in (ps.stdout or "").splitlines():
+                # 行样例: "8608  Demo            com.example.demo"
+                s = ln.strip()
+                if not s:
+                    continue
+                if not s.endswith(f" {package}"):
+                    continue
+                toks = s.split()
+                # 最后一个是 Identifier（包名），第一个数字是 PID，Name 介于中间（可能包含空格）
+                pid = None
+                for tok in toks:
+                    if tok.isdigit():
+                        pid = int(tok); break
+                # Name 列：从 PID 后到最后一个 token(包名) 之间的内容合并
+                try:
+                    last = s.rfind(package)
+                    after_pid = s.find(str(pid)) + len(str(pid))
+                    name = s[after_pid:last].strip()
+                except Exception:
+                    name = None
+                return (pid, name, ps.stdout or "", "")
+        except Exception:
+            return (None, None, "", "")
+        return (None, None, ps.stdout or "", "")
+
+    # 3) 首选 frida-python API
     if FRIDA_PY_AVAILABLE:
         try:
-            # check running processes via frida-ps
-            try:
-                ps = subprocess.run(["frida-ps", "-Uai"], capture_output=True, text=True, timeout=6)
-                p_stdout = ps.stdout or ""
-                proc_found = any((target_app in ln) for ln in p_stdout.splitlines())
-            except Exception:
-                proc_found = False
+            exact_pid = _pidof_exact(target_app)
+            pid_from_ps, name_from_ps, ps_out, ps_err = (None, None, "", "")
+            if exact_pid is None:
+                pid_from_ps, name_from_ps, ps_out, ps_err = _pick_from_frida_ps(target_app)
 
-            use_spawn = bool(spawn)
-            if not spawn and proc_found:
-                use_spawn = False
-            elif not spawn and not proc_found:
-                use_spawn = True
+            proc_found = exact_pid is not None or pid_from_ps is not None
 
-            # _start_frida_via_api_sync expects script_text WITHOUT console wrapper (it prepends it), so pass wrapped_no_console
-            res = _start_frida_via_api_sync(target_app, wrapped_no_console, use_spawn)
+            # 强约束：用户显式要求 spawn 则尊重；否则“进程存在就 attach，不存在再 spawn”
+            use_spawn = bool(spawn) or (not proc_found)
+
+            if use_spawn:
+                socketio.emit("frida_log", {"pid": -1, "line": f"[run] spawning {target_app} (no exact PID found)"} )
+            else:
+                msg = f"[run] attaching: "
+                if exact_pid is not None:
+                    msg += f"PID={exact_pid}"
+                elif pid_from_ps is not None:
+                    msg += f"PID={pid_from_ps}, Name={name_from_ps!r}"
+                socketio.emit("frida_log", {"pid": -1, "line": msg})
+
+            res = _start_frida_via_api_sync(
+                target_app=target_app,
+                script_text=wrapped_no_console,
+                use_spawn=use_spawn
+            )
             status_code = 200 if res.get("status") == "ok" else 500
             return jsonify(res), status_code
         except Exception as e:
             logging.error("frida api path failed: %s", traceback.format_exc())
-            # fallthrough to CLI fallback
+            # 回退到 CLI
 
-    # fallback to CLI subprocess
+    # 4) CLI 回退
     try:
-        check = subprocess.run(["frida","--version"], capture_output=True, text=True, timeout=5)
+        check = subprocess.run(["frida", "--version"], capture_output=True, text=True, timeout=5)
         if check.returncode != 0:
-            return jsonify({"error":"frida cli not available", "detail": check.stderr or check.stdout}), 500
+            return jsonify({"error": "frida cli not available", "detail": check.stderr or check.stdout}), 500
     except Exception as e:
-        return jsonify({"error":"frida cli check failed", "detail": str(e)}), 500
+        return jsonify({"error": "frida cli check failed", "detail": str(e)}), 500
 
-    # detect running process
-    try:
-        ps = subprocess.run(["frida-ps", "-Uai"], capture_output=True, text=True, timeout=8)
-        p_stdout = ps.stdout or ""
-        proc_found = any((target_app in ln) for ln in p_stdout.splitlines())
-    except Exception:
-        proc_found = False
+    # 再做一次解析，决定 attach/spawn 与附加目标
+    exact_pid = _pidof_exact(target_app)
+    pid_from_ps, name_from_ps, ps_out, ps_err = _pick_from_frida_ps(target_app)
 
-    use_spawn = bool(spawn)
-    if not spawn and proc_found:
-        use_spawn = False
-    elif not spawn and not proc_found:
-        use_spawn = True
+    use_spawn = bool(spawn) or (exact_pid is None and pid_from_ps is None)
 
     cmd = ["frida", "-U"]
     if use_spawn:
-        # do not add --no-pause universally because some frida versions error on it
+        socketio.emit("frida_log", {"pid": -1, "line": f"[cli] spawn -f {target_app} -l {os.path.basename(script_path)}"})
         cmd += ["-f", target_app, "-l", script_path]
     else:
-        cmd += ["-n", target_app, "-l", script_path]
+        if exact_pid is not None:
+            socketio.emit("frida_log", {"pid": -1, "line": f"[cli] attach -p {exact_pid} -l {os.path.basename(script_path)}"})
+            cmd += ["-p", str(exact_pid), "-l", script_path]
+        elif pid_from_ps is not None and name_from_ps:
+            # 复现你 CLI 成功路径：按 Name 附加
+            socketio.emit("frida_log", {"pid": -1, "line": f"[cli] attach -n {name_from_ps!r} -l {os.path.basename(script_path)}"})
+            cmd += ["-n", name_from_ps, "-l", script_path]
+        else:
+            # 兜底才用包名按名字附加
+            socketio.emit("frida_log", {"pid": -1, "line": f"[cli] attach -n {target_app} -l {os.path.basename(script_path)} (pid/name not resolved)"} )
+            cmd += ["-n", target_app, "-l", script_path]
 
     res = _start_frida_via_subprocess(cmd, script_path)
     if res.get("status") == "ok":
         return jsonify(res), 200
     else:
         return jsonify(res), 500
+
 @app.route('/api/run_frida_custom', methods=['POST'])
 @require_token
 def run_frida_custom():
@@ -1136,6 +1241,45 @@ def run_frida_custom():
     # Start the process and forward CLI stdout/stderr to frontend.
     res = _start_frida_via_subprocess(cmd, script_path)
     return jsonify(res), 200 if res.get("status") == "ok" else 500
+
+# ------------------ inject_frida API ------------------
+@app.route('/api/inject_frida', methods=['POST'])
+@require_token
+def inject_frida():
+    data = request.get_json(silent=True) or {}
+    target_app = data.get('app') or data.get('package')
+    template_name = data.get('template')
+    params = data.get('template_params') or {}
+    spawn = bool(data.get('spawn', False))
+    if not target_app or not template_name:
+        return jsonify({"error": "Missing app or template"}), 400
+
+    # 渲染模板
+    tpl = FRIDA_TEMPLATES.get(template_name)
+    if not tpl:
+        return jsonify({"error":"template not found"}), 404
+    user_script = safe_format(tpl, **params)
+
+    # 拼接 wrapper: 等待 Java + console 重定向
+    wrapped = wrap_user_script_wait_java(user_script)
+    final_script = CONSOLE_WRAPPER + "\n" + wrapped
+
+    # 保存脚本以便 CLI fallback
+    script_path = os.path.join(FRIDA_DIR, f"inject_{template_name}_{int(time.time())}.js")
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(final_script)
+
+    if FRIDA_PY_AVAILABLE:
+        result = _start_frida_via_api_sync(target_app, wrapped, spawn)
+        return jsonify(result), 200 if result.get('status') == 'ok' else 500
+
+    cmd = ["frida", "-U"]
+    if spawn:
+        cmd += ["-f", target_app, "-l", script_path]
+    else:
+        cmd += ["-n", target_app, "-l", script_path]
+    result = _start_frida_via_subprocess(cmd, script_path)
+    return jsonify(result), 200 if result.get('status') == 'ok' else 500
 
 
 
