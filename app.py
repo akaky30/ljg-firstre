@@ -800,16 +800,22 @@ def _start_frida_via_subprocess(cmd, script_path):
 
 def _start_frida_via_api_sync(target_app, script_text, use_spawn):
     """
-    Synchronous attach/spawn + create/load script using frida-python.
-    Returns dict {status/pid/script/...} - pid is real number when ok.
-    Auto-load a wait-for-Java wrapper if Java is undefined.
+    Attach/spawn + create/load script using frida-python.
+    增强版：增加延迟等待 ART 初始化，避免 Java.perform 不可用。
     """
     if not FRIDA_PY_AVAILABLE:
         return {"error": "frida python module not available"}
 
+    # 拼接 console wrapper
+    final_script = CONSOLE_WRAPPER + "\n" + script_text
+
+    # 辅助函数：精确获取 PID
     def _pidof_exact(package: str):
         try:
-            p = subprocess.run(["adb", "shell", "pidof", "-s", package], capture_output=True, text=True, timeout=4)
+            p = subprocess.run(
+                ["adb", "shell", "pidof", "-s", package],
+                capture_output=True, text=True, timeout=4
+            )
             out = (p.stdout or "").strip()
             if out and out.split()[0].isdigit():
                 return int(out.split()[0])
@@ -819,22 +825,14 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn):
 
     def _pick_exact_pid_from_ps(ps_out: str, package: str):
         for ln in (ps_out or "").splitlines():
-            s = ln.strip()
-            if not s:
+            if not ln.strip():
                 continue
-            if not s.endswith(f" {package}") and not s.endswith(f"\t{package}") and not s.endswith(package):
+            if not ln.endswith(package):
                 continue
-            toks = s.split()
-            for tok in toks:
+            for tok in ln.split():
                 if tok.isdigit():
                     return int(tok)
         return None
-
-    # 小工具：兼容 session.pid / session._pid
-    def _get_session_pid(session):
-        return getattr(session, "pid", getattr(session, "_pid", None))
-
-    final_script = CONSOLE_WRAPPER + "\n" + script_text
 
     try:
         try:
@@ -854,8 +852,9 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn):
                 device.resume(pid)
             except Exception:
                 pass
-            time.sleep(0.8)
-            socketio.emit("frida_log", {"pid": pid, "line": f"[api] spawn attached pid={pid}, resumed, waiting-for-Java..."})
+            # ⭐ 增加等待时间，保证 ART 初始化完成
+            time.sleep(3.0)
+            socketio.emit("frida_log", {"pid": pid, "line": f"[api] spawn attached pid={pid}, resumed, waiting-for-Java..."} )
         else:
             exact_pid = _pidof_exact(target_app)
             if exact_pid is None:
@@ -866,19 +865,19 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn):
                 except Exception:
                     exact_pid = None
 
-            try:
-                if exact_pid is not None:
-                    socketio.emit("frida_log", {"pid": -1, "line": f"[api] attach by PID {exact_pid} ({target_app})"})
-                    session = device.attach(exact_pid)
-                    pid = exact_pid
-                else:
-                    socketio.emit("frida_log", {"pid": -1, "line": f"[api] attach by NAME {target_app}"})
-                    session = device.attach(target_app)
-                    pid = _get_session_pid(session)
-            except Exception as e_attach:
-                raise RuntimeError(f"attach failed: {e_attach}")
+            if exact_pid is not None:
+                socketio.emit("frida_log", {"pid": -1, "line": f"[api] attach by PID {exact_pid} ({target_app})"})
+                session = device.attach(exact_pid)
+                pid = exact_pid
+            else:
+                socketio.emit("frida_log", {"pid": -1, "line": f"[api] attach by NAME {target_app} (pid 未找到)"} )
+                session = device.attach(target_app)
+                pid = session._impl.pid if hasattr(session, "_impl") else -1
 
-        # create script + message handler
+            # ⭐ 附加后也等一等，避免 ART 未初始化
+            time.sleep(1.5)
+
+        # 创建脚本
         script = session.create_script(final_script)
         ctx = {"fallback_injected": False}
 
@@ -894,32 +893,24 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn):
                 elif mtype == "error":
                     stack = message.get("stack") or message.get("description") or str(message)
                     socketio.emit("frida_log", {"pid": pid, "line": "[JS ERROR]\n" + str(stack)})
-                    try:
-                        s = str(stack)
-                        if ("Java" in s or "java" in s) and ("not defined" in s or "ReferenceError" in s) and not ctx["fallback_injected"]:
-                            ctx["fallback_injected"] = True
-                            try:
-                                fallback = CONSOLE_WRAPPER + "\n" + wrap_user_script_wait_java(script_text, max_attempts=600, delay_ms=200)
-                                fb_script = session.create_script(fallback)
-                                fb_script.on("message", on_message)
-                                fb_script.load()
-                                socketio.emit("frida_log", {"pid": pid, "line": "[FRIDA FALLBACK] loaded wait-for-Java wrapper"})
-                            except Exception as e_f:
-                                socketio.emit("frida_log", {"pid": pid, "line": "[FRIDA FALLBACK ERR] " + str(e_f)})
-                    except Exception:
-                        pass
+                    # fallback wrapper
+                    if ("Java" in stack or "java" in stack) and ("not defined" in stack or "ReferenceError" in stack) and not ctx["fallback_injected"]:
+                        ctx["fallback_injected"] = True
+                        try:
+                            fb_code = CONSOLE_WRAPPER + "\n" + wrap_user_script_wait_java(script_text, max_attempts=600, delay_ms=200)
+                            fb_script = session.create_script(fb_code)
+                            fb_script.on("message", on_message)
+                            fb_script.load()
+                            socketio.emit("frida_log", {"pid": pid, "line": "[FRIDA FALLBACK] loaded wait-for-Java wrapper"})
+                        except Exception as e_f:
+                            socketio.emit("frida_log", {"pid": pid, "line": "[FRIDA FALLBACK ERR] " + str(e_f)})
                 else:
                     socketio.emit("frida_log", {"pid": pid, "line": "[JS MSG] " + json.dumps(message, ensure_ascii=False)})
             except Exception as e:
-                socketio.emit("frida_log", {"pid": pid or -1, "line": "[on_message error] " + str(e)})
+                socketio.emit("frida_log", {"pid": pid, "line": "[on_message error] " + str(e)})
 
         script.on("message", on_message)
-
-        try:
-            script.load()
-        except Exception as e_load:
-            socketio.emit("frida_log", {"pid": pid or -1, "line": "[script.load error] " + str(e_load)})
-            raise
+        script.load()
 
         with FRIDA_SESSIONS_LOCK:
             FRIDA_SESSIONS[pid] = {"session": session, "script": script, "device": device, "target": target_app}
@@ -927,13 +918,15 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn):
         socketio.emit("frida_started", {"pid": pid, "script": f"(in-memory script for {target_app})", "spawn": use_spawn})
         logging.info("Started frida (api) pid=%s spawn=%s target=%s", pid, use_spawn, target_app)
         return {"status": "ok", "pid": pid, "script": f"(in-memory script for {target_app})", "spawn": use_spawn}
+
     except frida.TransportError as te:
         logging.error("frida transport error: %s", te)
-        socketio.emit("frida_log", {"pid": pid or -1, "line": f"[frida transport error] {te}"})
+        socketio.emit("frida_log", {"pid": pid or -1, "line": f"[frida transport error] {te}"} )
         return {"error": "frida api error", "detail": str(te)}
     except Exception as e:
         logging.error("frida api error: %s\n%s", e, traceback.format_exc())
         return {"error": "frida api error", "detail": str(e)}
+
 
 
 # ------------------ Consolidated wait-wrapper with improved diagnostics ------------------
