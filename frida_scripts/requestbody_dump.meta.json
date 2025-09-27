@@ -1,0 +1,29 @@
+{
+  "display_name": "RequestBody Dump (base64)",
+  "description": "在 okhttp3.RequestBody.writeTo 拦截处复制并打印完整请求体（base64），然后再写回真实 sink，不影响请求发送。",
+  "required_params": [],
+  "targets": [
+    "okhttp3.RequestBody",
+    "okio.Buffer",
+    "android.util.Base64"
+  ],
+  "risks": [
+    "会打印完整请求体，可能包含高度敏感信息",
+    "对超大文件上传等场景，复制到内存会造成额外内存与时间开销"
+  ],
+  "defaults": {
+    "enabled": true
+  },
+  "examples": [
+    {
+      "template": "requestbody_dump",
+      "template_params": {}
+    }
+  ],
+  "notes": [
+    "该模板比 newCall 级别的 Hook 更稳定地捕获请求体，但代价是额外内存拷贝。",
+    "如需在前端提供大小阈值过滤，建议将阈值做成占位符并在 JS 中判断 Buffer 大小后再决定打印。"
+  ],
+  "version": "1.0.0",
+  "author": "akaky"
+}

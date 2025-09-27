@@ -1,0 +1,30 @@
+{
+  "display_name": "SharedPreferences Dump (读写跟踪)",
+  "description": "Hook SharedPreferencesImpl 与 EditorImpl，打印 getString/getAll 读取与 put*/apply/commit 写入操作，并尽量显示所属 XML 文件路径。",
+  "required_params": [],
+  "targets": [
+    "android.app.SharedPreferencesImpl",
+    "android.app.SharedPreferencesImpl$EditorImpl"
+  ],
+  "risks": [
+    "可能打印包含账号、token 等敏感信息的键值",
+    "大量日志输出会带来性能开销"
+  ],
+  "defaults": {
+    "log_getAll": true,
+    "log_getString": true,
+    "log_put": true,
+    "log_apply_commit": true
+  },
+  "examples": [
+    {
+      "template": "sharedprefs_dump",
+      "template_params": {}
+    }
+  ],
+  "notes": [
+    "当前模板无需参数；defaults 仅用于前端 UI 开关展示的默认值，脚本本体尚未读取这些参数。后续可将这些开关做成脚本占位符以支持按需裁剪日志量。"
+  ],
+  "version": "1.0.0",
+  "author": "your-name"
+}

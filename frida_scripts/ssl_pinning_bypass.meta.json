@@ -1,0 +1,32 @@
+{
+  "display_name": "SSL Pinning Bypass (OkHttp/Hostname/TrustManager/HUC)",
+  "description": "对 OkHttp CertificatePinner、OkHostnameVerifier、javax.net.ssl.SSLContext.init 与 javax.net.ssl.HttpsURLConnection 进行 Hook，放宽证书/主机名校验，便于调试抓包。",
+  "required_params": [],
+  "targets": [
+    "okhttp3.CertificatePinner",
+    "okhttp3.internal.tls.OkHostnameVerifier",
+    "javax.net.ssl.SSLContext",
+    "javax.net.ssl.HttpsURLConnection"
+  ],
+  "risks": [
+    "禁用/绕过证书校验会降低安全性，仅限本地调试与合法测试环境使用",
+    "可能被安全检测/风控策略识别，导致应用异常或崩溃"
+  ],
+  "defaults": {
+    "enable_okhttp_pinner": true,
+    "enable_hostname_verifier": true,
+    "enable_trust_manager": true,
+    "enable_httpsurlconnection": true
+  },
+  "examples": [
+    {
+      "template": "ssl_pinning_bypass",
+      "template_params": {}
+    }
+  ],
+  "notes": [
+    "当前模板无需参数；defaults 便于前端展示功能勾选项。若后续将这些开关做成脚本占位符，可按需只启用某些绕过分支。"
+  ],
+  "version": "1.0.0",
+  "author": "your-name"
+}

@@ -1,0 +1,30 @@
+{
+  "display_name": "OkHttp URL/Body Logger",
+  "description": "Hook okhttp3.OkHttpClient.newCall，打印请求 URL 与请求体（base64）。便于对接 MITM 或快速定位关键接口。",
+  "required_params": [],
+  "targets": [
+    "okhttp3.OkHttpClient",
+    "okhttp3.Request",
+    "okio.Buffer",
+    "android.util.Base64"
+  ],
+  "risks": [
+    "可能输出包含密码、Token、身份证号等敏感信息的请求体内容",
+    "对大请求体的 base64 打印会增加日志量与性能开销"
+  ],
+  "defaults": {
+    "log_body_base64": true
+  },
+  "examples": [
+    {
+      "template": "okhttp_log_url",
+      "template_params": {}
+    }
+  ],
+  "notes": [
+    "当前脚本总是打印 base64 编码的请求体（如存在）。defaults 主要用于前端 UI 开关展示。",
+    "若需有选择地关闭体打印，可在 JS 中将该选项改为占位符并做条件判断。"
+  ],
+  "version": "1.0.0",
+  "author": "akaky"
+}

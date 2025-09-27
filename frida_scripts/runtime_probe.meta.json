@@ -1,0 +1,24 @@
+{
+  "display_name": "Runtime Probe",
+  "description": "快速探测运行环境：打印 Java.available 与部分已加载模块名，用于判断注入时机与 Java 环境是否可用。",
+  "required_params": [],
+  "targets": ["Frida Process", "Java Runtime"],
+  "risks": [
+    "仅输出环境信息，无实际业务风险"
+  ],
+  "defaults": {
+    "modules_sample_size": 50
+  },
+  "examples": [
+    {
+      "template": "runtime_probe",
+      "template_params": {}
+    }
+  ],
+  "notes": [
+    "主要用于排错：如看到 Java.available=false，多半是注入过早或附错进程。",
+    "modules_sample_size 为展示用途，当前脚本未读取该值；如需控制输出数量，可把它做成占位符。"
+  ],
+  "version": "1.0.0",
+  "author": "akaky"
+}

@@ -1,0 +1,30 @@
+{
+  "display_name": "Search JWT in Static Strings",
+  "description": "遍历已加载类，检查所有静态 String 字段是否包含/等于 JWT（同时尝试 Base64 解码后再匹配），用于快速发现硬编码或拼接后的令牌。",
+  "required_params": [],
+  "targets": [
+    "android.util.Base64",
+    "Java ClassLoader",
+    "java.lang.reflect.Field"
+  ],
+  "risks": [
+    "扫描范围大、时长取决于类数量（可能造成一定性能负担）",
+    "可能打印敏感令牌，请在合法测试环境使用并妥善处理输出"
+  ],
+  "defaults": {
+    "strict_mode": true,
+    "scan_limit": 0
+  },
+  "examples": [
+    {
+      "template": "search_jwt_in_static_strings",
+      "template_params": {}
+    }
+  ],
+  "notes": [
+    "strict_mode/scan_limit 为前端 UI 提示用途；当前脚本总是全量扫描并同时进行严格匹配与局部匹配。",
+    "如需限制扫描类数量或仅做严格匹配，可将这些选项改为占位符并在脚本中加入判断逻辑。"
+  ],
+  "version": "1.0.0",
+  "author": "akaky"
+}

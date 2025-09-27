@@ -1,0 +1,37 @@
+{
+  "display_name": "Dump Class String Fields",
+  "description": "选择能加载目标类的 ClassLoader，枚举并打印该类的静态与实例 String 字段值，可按字段名关键词做过滤。",
+  "required_params": ["class_name"],
+  "targets": [
+    "Java ClassLoader",
+    "java.lang.reflect.Field",
+    "java.lang.reflect.Modifier"
+  ],
+  "risks": [
+    "可能包含账号、密钥、Token 等敏感信息，请仅在合法调试环境使用",
+    "对大类或大量实例执行会带来明显性能开销"
+  ],
+  "defaults": {
+    "include_static": true,
+    "include_instance": true,
+    "fields_filter": ""
+  },
+  "examples": [
+    {
+      "template": "dump_class_string_fields",
+      "template_params": {
+        "class_name": "com.example.app.Config",
+        "include_static": true,
+        "include_instance": false,
+        "fields_filter": "token,secret,key"
+      }
+    }
+  ],
+  "notes": [
+    "fields_filter 为逗号分隔的关键词，命中任意一个即打印；留空则不过滤。",
+    "include_static/ include_instance 控制是否打印静态/实例字段。",
+    "如目标类在自定义 ClassLoader 中，本模板会自动探测并切换。"
+  ],
+  "version": "1.0.0",
+  "author": "akaky"
+}

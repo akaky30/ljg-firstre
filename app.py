@@ -117,6 +117,71 @@ def require_token(fn):
         return fn(*args, **kwargs)
     return wrapper
 
+# === External Frida template loader （新增）===
+from dataclasses import dataclass
+import glob
+
+SCRIPTS_DIR = os.path.join(BASE_DIR, "frida_scripts")
+
+@dataclass
+class TemplateSpec:
+    name: str
+    path: str
+    code: str
+    meta: dict
+    mtime: float
+
+TEMPLATE_CACHE = {}  # name -> TemplateSpec
+
+def _load_meta(js_path: str) -> dict:
+    meta_path = js_path.replace(".js", ".meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"display_name": os.path.basename(js_path),
+            "required_params": [], "targets": [], "risks": [], "defaults": {}}
+
+def load_templates():
+    os.makedirs(SCRIPTS_DIR, exist_ok=True)
+    for js_path in glob.glob(os.path.join(SCRIPTS_DIR, "*.js")):
+        name = os.path.splitext(os.path.basename(js_path))[0]
+        mtime = os.path.getmtime(js_path)
+        if name in TEMPLATE_CACHE and TEMPLATE_CACHE[name].mtime == mtime:
+            continue
+        with open(js_path, "r", encoding="utf-8") as f:
+            code = f.read()
+        TEMPLATE_CACHE[name] = TemplateSpec(
+            name=name, path=js_path, code=code, meta=_load_meta(js_path), mtime=mtime
+        )
+
+# safe_format 与参数渲染（保留 + 新增对外置模板的渲染）
+class SafeDict(dict):
+    def __missing__(self, key):
+        return "{%s}" % key
+
+def safe_format(tpl: str, **params):
+    try:
+        return tpl.format_map(SafeDict(**params))
+    except Exception:
+        out = tpl
+        for k, v in params.items():
+            out = out.replace("{" + k + "}", str(v))
+        return out
+
+def render_template_external(name: str, params: dict) -> str:
+    """从外置模板缓存中渲染脚本（带 defaults / required 校验）"""
+    load_templates()
+    spec = TEMPLATE_CACHE.get(name)
+    if not spec:
+        raise ValueError(f"template not found: {name}")
+    merged = dict(spec.meta.get("defaults", {}))
+    merged.update(params or {})
+    missing = [k for k in spec.meta.get("required_params", [])
+               if merged.get(k) in (None, "", [])]
+    if missing:
+        raise ValueError(f"missing required params: {missing}")
+    return safe_format(spec.code, **merged)
+
 # ------------------ Sessions API ------------------
 @app.route("/api/sessions", methods=["POST"])
 def add_session():
@@ -265,382 +330,33 @@ def export_sessions():
         return si.getvalue(), 200, {'Content-Type':'text/csv; charset=utf-8','Content-Disposition':'attachment; filename="sessions.csv"'}
     return jsonify(data)
 
-# ------------------ FRIDA templates & helpers (safe for .format) ------------------
-FRIDA_TEMPLATES = {
-    # 0) 运行环境探针：确认 Java 可用 & 打点
-    "runtime_probe": r"""
-(function(){{
-  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
-  try {{ log('[probe] Java.available =', (typeof Java!=='undefined')? Java.available:false); }} catch(e){{ log('[probe] err', e); }}
-  try {{
-    var mods = Process.enumerateModulesSync().slice(0,50).map(function(m){{return m.name;}});
-    log('[probe-modules]', mods.join(', '));
-  }} catch(e){{}}
-}})();
-""",
-
-    # 1) OkHttp：打印请求 URL + 请求体（base64）
-    "okhttp_log_url": r"""
-Java.perform(function(){{
-  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
-  try {{
-    var OkHttpClient = Java.use('okhttp3.OkHttpClient');
-    var Buffer = Java.use('okio.Buffer');
-    var Base64 = Java.use('android.util.Base64');
-    var newCall_over = OkHttpClient.newCall.overload('okhttp3.Request');
-
-    newCall_over.implementation = function(request){{
-      try {{
-        var url = "(unknown)"; try {{ url = request.url().toString(); }} catch(e){{}}
-        log('[okhttp hook] url=', url);
-        try {{
-          var body = request.body();
-          if (body) {{
-            var buf = Buffer.$new();
-            body.writeTo(buf);
-            var bytes = buf.readByteArray();
-            log('[okhttp hook][body][base64]', Base64.encodeToString(bytes, 0));
-          }} else {{
-            log('[okhttp hook] no body');
-          }}
-        }} catch(e){{ log('[okhttp hook] read body err:', e); }}
-        return newCall_over.call(this, request);
-      }} catch(inner){{
-        try {{ return newCall_over.call(this, request); }} catch(e){{ return this.newCall(request); }}
-      }}
-    }};
-    log('[okhttp hook] installed');
-  }} catch(e){{
-    log('[okhttp hook] install failed:', e);
-  }}
-}});
-""",
-
-    # 2) OkHttp：在 RequestBody.writeTo 处抓包（base64）
-    "requestbody_dump": r"""
-Java.perform(function() {{
-  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
-  try {{
-    var RequestBody = Java.use("okhttp3.RequestBody");
-    var Buffer = Java.use("okio.Buffer");
-    var Base64 = Java.use("android.util.Base64");
-    var writeToOver = RequestBody.writeTo.overload("okio.BufferedSink");
-
-    writeToOver.implementation = function(sink) {{
-      try {{
-        var buf = Buffer.$new();
-        writeToOver.call(this, buf);           // 先写到内存
-        var bytes = buf.readByteArray();
-        log("[RequestBody] base64:", Base64.encodeToString(bytes, 0));
-      }} catch(e) {{ log("RB err:", e); }}
-      return writeToOver.call(this, sink);     // 再写回真实 sink
-    }};
-    log("[RequestBody] hook installed");
-  }} catch(e) {{ log("RequestBody hook fail", e); }}
-}});
-""",
-
-    # 3) SSL Pinning Bypass（OkHttp + Hostname + TrustManager + HttpsURLConnection 兜底）
-    "ssl_pinning_bypass": r"""
-Java.perform(function() {{
-  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
-
-  // 3.1 OkHttp CertificatePinner.check 全覆盖
-  try {{
-    var CertPinner = Java.use('okhttp3.CertificatePinner');
-    if (CertPinner.check) {{
-      CertPinner.check.overloads.forEach(function(ov, idx){{
-        ov.implementation = function(){{ log('[bypass] CertificatePinner.check #'+idx+' -> bypass'); return; }};
-      }});
-    }}
-    if (CertPinner['check$okhttp']) {{
-      CertPinner['check$okhttp'].overloads.forEach(function(ov, idx){{
-        ov.implementation = function(){{ log('[bypass] CertificatePinner.check$okhttp #'+idx+' -> bypass'); return; }};
-      }});
-    }}
-  }} catch(e){{ log('[bypass] CertPinner hook failed:', e); }}
-
-  // 3.2 Hostname 验证兜底
-  try {{
-    var OkHostnameVerifier = Java.use('okhttp3.internal.tls.OkHostnameVerifier');
-    if (OkHostnameVerifier && OkHostnameVerifier.verify) {{
-      OkHostnameVerifier.verify.overloads.forEach(function(ov){{
-        ov.implementation = function(host, session){{ log('[bypass] OkHostnameVerifier.verify host='+host+' -> true'); return true; }};
-      }});
-    }}
-  }} catch(e){{ log('[bypass] OkHostnameVerifier hook failed:', e); }}
-
-  // 3.3 全局 TrustManager（替换 SSLContext.init）
-  try {{
-    var X509TM = Java.use('javax.net.ssl.X509TrustManager');
-    var SSLContext = Java.use('javax.net.ssl.SSLContext');
-
-    var TrustAll = Java.registerClass({{
-      name: 'org.frida.TrustAllManager',
-      implements: [X509TM],
-      methods: {{
-        checkClientTrusted: function(chain, authType) {{}},
-        checkServerTrusted: function(chain, authType) {{}},
-        getAcceptedIssuers: function() {{ return []; }}
-      }}
-    }});
-
-    var initOver = SSLContext.init.overload('[Ljavax.net.ssl.KeyManager;','[Ljavax.net.ssl.TrustManager;','java.security.SecureRandom');
-    initOver.implementation = function(km, tm, sr){{
-      log('[bypass] SSLContext.init -> replace TrustManager');
-      return initOver.call(this, km, [TrustAll.$new()], sr);
-    }};
-  }} catch(e){{ log('[bypass] SSLContext hook failed:', e); }}
-
-  // 3.4 HttpsURLConnection 兜底
-  try {{
-    var HUC = Java.use('javax.net.ssl.HttpsURLConnection');
-    HUC.setDefaultHostnameVerifier.implementation = function(verifier){{
-      log('[bypass] HttpsURLConnection.setDefaultHostnameVerifier ignored');
-      return; // 丢弃外部设置
-    }};
-  }} catch(e){{}}
-}});
-""",
-
-    # 4) SharedPreferences Dump（读全打印 + Editor 写路径打印）
-    "sharedprefs_dump": r"""
-Java.perform(function() {{
-  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
-  try {{
-    var SPImpl = Java.use('android.app.SharedPreferencesImpl');
-    var EditorImpl = Java.use('android.app.SharedPreferencesImpl$EditorImpl');
-
-    function whichFile(sp) {{
-      try {{
-        var f = sp.getClass().getDeclaredField('mFile');
-        f.setAccessible(true);
-        var file = f.get(sp);
-        return file ? file.getAbsolutePath() : '(unknown-file)';
-      }} catch(e) {{ return '(unknown-file)'; }}
-    }}
-
-    if (SPImpl.getAll) {{
-      var getAll = SPImpl.getAll.overload();
-      getAll.implementation = function() {{
-        var ret = getAll.call(this);
-        try {{ log('[SharedPreferences][getAll] file=', whichFile(this), ' -> ', ret.toString()); }} catch(e){{}}
-        return ret;
-      }};
-    }}
-    if (SPImpl.getString) {{
-      var getStr = SPImpl.getString.overload('java.lang.String','java.lang.String');
-      getStr.implementation = function(key, def) {{
-        var v = getStr.call(this, key, def);
-        try {{ log('[SharedPreferences][getString] file=', whichFile(this), ' ', key, ' = ', v); }} catch(e){{}}
-        return v;
-      }};
-    }}
-
-    function hookEditor(name, sig) {{
-      try {{
-        var ov = EditorImpl[name].overload.apply(EditorImpl[name], sig);
-        ov.implementation = function() {{
-          try {{
-            if (name.startsWith('put')) {{
-              log('[SharedPreferences][Editor.'+name+']', arguments[0], '=', arguments[1]);
-            }} else if (name === 'remove') {{
-              log('[SharedPreferences][Editor.remove] key=', arguments[0]);
-            }} else if (name === 'clear') {{
-              log('[SharedPreferences][Editor.clear]');
-            }} else if (name === 'apply' || name === 'commit') {{
-              log('[SharedPreferences][Editor.'+name+']');
-            }}
-          }} catch(e){{}}
-          return ov.apply(this, arguments);
-        }};
-      }} catch(e){{}}
-    }}
-
-    hookEditor('putString', ['java.lang.String','java.lang.String']);
-    hookEditor('putInt', ['java.lang.String','int']);
-    hookEditor('putLong', ['java.lang.String','long']);
-    hookEditor('putFloat', ['java.lang.String','float']);
-    hookEditor('putBoolean', ['java.lang.String','boolean']);
-    hookEditor('remove', ['java.lang.String']);
-    hookEditor('clear', []);
-    hookEditor('apply', []);
-    hookEditor('commit', []);
-
-    log('[SharedPreferences] hooks installed');
-  }} catch(e) {{ log('sharedprefs_dump err:', e); }}
-}});
-""",
-
-    # 5) Dump class string fields（静态 + 实例；自动挑 Loader）。需要传入 class_name
-    "dump_class_string_fields": r"""
-Java.perform(function () {{
-  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
-
-  var clsName = "{class_name}";
-  log("[dump] target class:", clsName);
-
-  // 5.1 选择能加载该类的 ClassLoader
-  try {{
-    var loaders = Java.enumerateClassLoadersSync();
-    var picked = null;
-    for (var i = 0; i < loaders.length; i++) {{
-      var L = loaders[i];
-      try {{ if (L.findClass && L.findClass(clsName)) {{ picked = L; break; }} }} catch(_){{
-      }}
-      try {{ if (L.loadClass && L.loadClass(clsName, false)) {{ picked = L; break; }} }} catch(_){{
-      }}
-    }}
-    if (picked) {{ Java.classFactory.loader = picked; log("[dump] picked loader:", picked.$className || picked.toString()); }}
-  }} catch(e){{}}
-
-  // 5.2 打印静态 String 字段
-  var staticOK = false;
-  try {{
-    var Clz = Java.use(clsName);
-    var Modifier = Java.use("java.lang.reflect.Modifier");
-    var fields = Clz.class.getDeclaredFields();
-    for (var i = 0; i < fields.length; i++) {{
-      try {{
-        var f = fields[i]; f.setAccessible(true);
-        if (Modifier.isStatic(f.getModifiers()) && f.getType().getName() === "java.lang.String") {{
-          var val = f.get(null);
-          log("[DUMP][static]", clsName + "." + f.getName(), "=", val);
-          staticOK = true;
-        }}
-      }} catch (eF) {{}}
-    }}
-  }} catch (eClz) {{
-    log("[dump] ERROR: cannot use class:", eClz);
-  }}
-  if (!staticOK) log("[dump] no static String fields or not accessible");
-
-  // 5.3 枚举实例并打印实例字段
-  var found = false;
-  Java.choose(clsName, {{
-    onMatch: function (inst) {{
-      found = true;
-      try {{
-        var flds = inst.getClass().getDeclaredFields();
-        var Modifier = Java.use('java.lang.reflect.Modifier');
-        for (var i = 0; i < flds.length; i++) {{
-          try {{
-            flds[i].setAccessible(true);
-            if (flds[i].getType().getName() === "java.lang.String"
-                && !Modifier.isStatic(flds[i].getModifiers())) {{
-              var v = flds[i].get(inst);
-              log("[DUMP][instance]", clsName + "#" + flds[i].getName(), "=", v);
-            }}
-          }} catch (e1) {{}}
-        }}
-      }} catch (e2) {{}}
-    }},
-    onComplete: function () {{ if (!found) log("[dump] no instance found for", clsName); log("[dump] choose complete for", clsName); }}
-  }});
-}});
-""",
-
-    # 6) 搜索所有类的静态 String 中的 JWT（含 Base64 解码尝试）
-    "search_jwt_in_static_strings": r"""
-Java.perform(function() {{
-  function log(){{ try{{ send({{__frida_console:true, args:[].map.call(arguments, function(x){{return ''+x;}})}}); }}catch(e){{}} }}
-
-  // 尝试锁定 App 的 ClassLoader（通过 BuildConfig）
-  try {{
-    var app = Java.use('android.app.ActivityThread').currentApplication();
-    if (app) {{
-      var pkg = app.getApplicationContext().getPackageName();
-      var buildCfg = pkg + ".BuildConfig";
-      var loaders = Java.enumerateClassLoadersSync();
-      for (var i=0;i<loaders.length;i++){{ 
-        try {{ if (loaders[i].loadClass(buildCfg)) {{ Java.classFactory.loader = loaders[i]; log('[search_jwt] set loader by BuildConfig'); break; }} }} catch(e){{}} 
-      }}
-    }}
-  }} catch(e){{}}
-
-  var JWT_RE_GLOBAL = /[A-Za-z0-9\-_]+?\.[A-Za-z0-9\-_]+?\.[A-Za-z0-9\-_]+/g;
-  var JWT_RE_STRICT = /^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$/;
-
-  function toJsString(v){{ try {{ return (v===null||v===undefined) ? "" : (""+v); }} catch(e){{ return ""; }} }}
-  function tryBase64Decode(s){{
-    try {{
-      var Base64 = Java.use('android.util.Base64');
-      var bytes = Base64.decode(s, 0);
-      var JStr = Java.use('java.lang.String');
-      return JStr.$new(bytes).toString();
-    }} catch(e){{ return ""; }}
-  }}
-
-  var Modifier = Java.use('java.lang.reflect.Modifier');
-  var classes = Java.enumerateLoadedClassesSync();
-  log("[search_jwt] loaded classes:", classes.length);
-
-  for (var i=0;i<classes.length;i++){{ 
-    var name = classes[i];
-    try {{
-      var C = Java.use(name);
-      var fields = C.class.getDeclaredFields();
-      for (var j=0;j<fields.length;j++){{ 
-        try {{
-          var f = fields[j]; f.setAccessible(true);
-          if (!Modifier.isStatic(f.getModifiers())) continue;
-          if (f.getType().getName() !== "java.lang.String") continue;
-
-          var val = toJsString(f.get(null));
-          if (!val) continue;
-
-          if (JWT_RE_STRICT.test(val)) {{
-            log("[JWT static] class=", name, " field=", f.getName(), " value=", val);
-            continue;
-          }}
-          var m = val.match(JWT_RE_GLOBAL);
-          if (m && m.length) {{
-            m.forEach(function(tok){{ log("[JWT static(sub)] class=", name, " field=", f.getName(), " value=", tok); }});
-            continue;
-          }}
-          var dec = tryBase64Decode(val);
-          if (dec) {{
-            if (JWT_RE_STRICT.test(dec)) {{
-              log("[JWT static][b64] class=", name, " field=", f.getName(), " value=", dec);
-              continue;
-            }}
-            var m2 = dec.match(JWT_RE_GLOBAL);
-            if (m2 && m2.length) {{
-              m2.forEach(function(tok){{ log("[JWT static(sub)][b64] class=", name, " field=", f.getName(), " value=", tok); }});
-            }}
-          }}
-        }} catch(ef) {{}}
-      }}
-    }} catch(ec) {{}}
-  }}
-  log("[search_jwt] done.");
-}});
-"""
-}
-
-
-
-
-# safe_format: missing keys remain as {key}
-class SafeDict(dict):
-    def __missing__(self, key):
-        return "{%s}" % key
-
-def safe_format(tpl: str, **params):
-    try:
-        return tpl.format_map(SafeDict(**params))
-    except Exception:
-        out = tpl
-        for k, v in params.items():
-            out = out.replace("{" + k + "}", str(v))
-        return out
-
+# === 模板接口：获取某个模板源码（改为外置） ===
 @app.route('/api/frida_template/<name>', methods=['GET'])
 def get_frida_template(name):
-    tpl = FRIDA_TEMPLATES.get(name)
-    if not tpl:
-        return jsonify({"error":"template not found"}), 404
-    return tpl, 200
+    try:
+        load_templates()
+        spec = TEMPLATE_CACHE.get(name)
+        if not spec:
+            return jsonify({"error":"template not found"}), 404
+        return spec.code, 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# === 模板接口：列出全部模板（新增） ===
+@app.route("/api/frida/templates", methods=["GET"])
+def list_frida_templates():
+    load_templates()
+    out = []
+    for name, spec in TEMPLATE_CACHE.items():
+        out.append({
+            "name": name,
+            "display_name": spec.meta.get("display_name", name),
+            "required_params": spec.meta.get("required_params", []),
+            "targets": spec.meta.get("targets", []),
+            "risks": spec.meta.get("risks", []),
+            "defaults": spec.meta.get("defaults", {}),
+        })
+    return jsonify(out)
 
 # ------------------ generate_frida ------------------
 @app.route('/api/generate_frida', methods=['POST'])
@@ -649,32 +365,29 @@ def generate_frida():
     template_name = data.get("template")
     params = data.get("template_params") or {}
     if template_name:
-        tpl = FRIDA_TEMPLATES.get(template_name)
-        if not tpl:
-            return jsonify({"error":"template not found"}), 404
         try:
-            script = safe_format(tpl, **params)
+            script = render_template_external(template_name, params)
             return script, 200
         except Exception as e:
             logging.error("generate_frida template render failed: %s", traceback.format_exc())
-            return jsonify({"error":"template render failed", "detail": str(e)}), 500
+            return jsonify({"error":"template render failed", "detail": str(e)}), 400
 
     session_id = data.get('id')
     if not session_id:
-        return jsonify({"error":"missing id"}), 400
+        return jsonify({"error":"missing id or template"}), 400
     conn = db_conn()
     row = conn.execute("SELECT url, headers, body, suspicious FROM sessions WHERE id=?", (session_id,)).fetchone()
     conn.close()
     if not row:
         return "Session not found", 404
     url, headers_json, body, suspicious_json = row[0], row[1], row[2], row[3]
-    template = FRIDA_TEMPLATES.get("requestbody_dump") if (body and len(body.strip())>0) else FRIDA_TEMPLATES.get("okhttp_log_url")
+    inferred = "requestbody_dump" if (body and len(body.strip())>0) else "okhttp_log_url"
     try:
-        frida_script = safe_format(template, url=url)
+        frida_script = render_template_external(inferred, {"url": url})
         return frida_script, 200
     except Exception as e:
         logging.error("generate_frida session render failed: %s", traceback.format_exc())
-        return jsonify({"error":"template render failed", "detail": str(e)}), 500
+        return jsonify({"error":"template render failed", "detail": str(e)}), 400
 
 # ------------------ probe endpoint ------------------
 @app.route('/api/probe', methods=['POST'])
@@ -698,7 +411,7 @@ def probe_process():
         logging.error("probe error: %s", traceback.format_exc())
         return jsonify({"error":"probe failed", "detail": str(e)}), 500
 
-# ------------------ run_frida helpers ------------------
+# ------------------ FRIDA helpers ------------------
 FRIDA_SESSIONS = {}  # pid -> {session, script, device, target}
 FRIDA_SESSIONS_LOCK = threading.Lock()
 
@@ -769,7 +482,6 @@ def _start_frida_via_subprocess(cmd, script_path):
     as-is so the frontend sees the same output you see when running the CLI locally.
     """
     try:
-        # Use the exact cmd provided by the caller (do not inject flags here).
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         pid = p.pid
         logging.info("Started frida subprocess pid=%s cmd=%s", pid, " ".join(cmd))
@@ -777,7 +489,6 @@ def _start_frida_via_subprocess(cmd, script_path):
 
         def reader_thread(stream, prefix=""):
             try:
-                # Read until EOF. We decode per-line and forward to frontend.
                 for raw in iter(stream.readline, b""):
                     if not raw:
                         break
@@ -789,7 +500,6 @@ def _start_frida_via_subprocess(cmd, script_path):
             except Exception as e:
                 socketio.emit("frida_log", {"pid": pid, "line": f"[reader error] {e}"})
 
-        # Start background tasks for stdout and stderr
         socketio.start_background_task(reader_thread, p.stdout, "")
         socketio.start_background_task(reader_thread, p.stderr, "[ERR] ")
 
@@ -801,23 +511,15 @@ def _start_frida_via_subprocess(cmd, script_path):
 def _start_frida_via_api_sync(target_app, script_text, use_spawn, attach_pid=None, attach_name=None):
     """
     通过 frida-python 同步 attach/spawn + load script。
-    关键点：
-    - 只选 USB/remote 设备（不回落 local），打印设备 id/type，避免误连本机；
-    - attach 前在该设备上校验 PID/Name 是否真实存在；
-    - spawn: spawn -> attach(pid) -> resume(pid) -> sleep(1.5s) -> load；
-    - 明确指定 runtime='v8' 创建脚本，规避个别环境下 QJS + Java 注入时机问题；
-    - 脚本本身已用 setImmediate(Java.perform(...)) 包裹（与 CLI 保持一致）。
     """
     if not FRIDA_PY_AVAILABLE:
         return {"error": "frida python module not available"}
 
-    # 选设备：只接受 usb / remote
     def _pick_android_device():
         try:
             mgr = frida.get_device_manager()
             devs = mgr.enumerate_devices()
             cands = [d for d in devs if d.type in ("usb", "remote")]
-            # 优先 remote/adb 透传（常见 id 中包含 127.0.0.1 或 tcp）
             for d in cands:
                 if "127.0.0.1" in (d.id or "") or ":5555" in (d.id or "") or str(d.id or "").startswith("tcp@"):
                     return d
@@ -827,7 +529,6 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn, attach_pid=Non
         except Exception:
             return None
 
-    # 在设备上检查 PID / 名称是否存在
     def _proc_exists_on_device(dev, pid=None, name=None, package=None):
         try:
             plist = dev.enumerate_processes()
@@ -876,7 +577,6 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn, attach_pid=Non
             socketio.emit("frida_log", {"pid": pid, "line": f"[api] spawn attached pid={pid}, resumed, sleeping before load ..."})
 
         else:
-            # 先用传入的 PID/Name 校验，避免附加到错误进程
             ok, proc = (False, None)
             if attach_pid is not None:
                 ok, proc = _proc_exists_on_device(device, pid=attach_pid)
@@ -892,7 +592,6 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn, attach_pid=Non
                 socketio.emit("frida_log", {"pid": -1, "line": "[api] " + detail})
                 return {"error": "frida api error", "detail": detail}
 
-            # 按优先级附加
             if attach_pid is not None and _proc_exists_on_device(device, pid=attach_pid)[0]:
                 socketio.emit("frida_log", {"pid": -1, "line": f"[api] attach by PID {attach_pid} ({target_app})"})
                 session = device.attach(attach_pid)
@@ -916,11 +615,9 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn, attach_pid=Non
                     except Exception:
                         pid = None
 
-        # 建立脚本 + 消息通道；显式选择 V8 运行时
         try:
             script = session.create_script(final_script, runtime='v8')
         except TypeError:
-            # 兼容旧 frida-python（不支持 runtime 参数）
             script = session.create_script(final_script)
 
         def on_message(message, data):
@@ -959,23 +656,11 @@ def _start_frida_via_api_sync(target_app, script_text, use_spawn, attach_pid=Non
         return {"error": "frida api error", "detail": str(e)}
 
 
-
-
 # ------------------ Consolidated wait-wrapper with improved diagnostics ------------------
 def wrap_user_script_wait_java(user_js: str, max_attempts: int = 50, delay_ms: int = 100):
-
-    """
-    Robust wrapper: waits for Java (using Java.available when possible). On timeout it
-    emits detailed diagnostics (modules list, ranges count) and attempts a final
-    non-Java invocation of the user code as a fallback.
-    Returns wrapper JS string (to be prepended with CONSOLE_WRAPPER by the caller).
-    """
     if user_js is None:
         user_js = """"""
-
-    # indent user code
     indented = "\n".join("        " + line for line in user_js.splitlines())
-
     tpl = f"""
 (function(){{
   try {{ send({{'__frida_console':true, 'args':['[WRAP] wrapper loaded']}}); }} catch(e){{}}
@@ -1036,8 +721,8 @@ def wrap_user_script_wait_java(user_js: str, max_attempts: int = 50, delay_ms: i
 
 }})();
 """
-
     return tpl
+
 @app.route('/api/run_frida', methods=['POST'])
 @require_token
 def run_frida():
@@ -1048,20 +733,17 @@ def run_frida():
     template_name = data.get("template")
     params = data.get("template_params") or {}
     script_override = data.get("script")
-    force_cli = bool(data.get("force_cli", False))  # 可选：前端传 true 强制走 CLI
+    force_cli = bool(data.get("force_cli", False))
 
     if not target_app:
         return jsonify({"error": "Missing target app"}), 400
 
-    # 1) 生成 “用户脚本”
+    # 1) 生成 “用户脚本” （改：从外置模板渲染）
     try:
         if script_override:
             user_js = script_override
         elif template_name:
-            tpl = FRIDA_TEMPLATES.get(template_name)
-            if not tpl:
-                return jsonify({"error":"template not found"}), 404
-            user_js = safe_format(tpl, **params)
+            user_js = render_template_external(template_name, params)
         elif session_id:
             conn = db_conn()
             row = conn.execute("SELECT url, headers, body FROM sessions WHERE id=?", (session_id,)).fetchone()
@@ -1069,15 +751,15 @@ def run_frida():
             if not row:
                 return jsonify({"error":"Session not found"}), 404
             url = row[0]; body = row[2]
-            base_tpl = FRIDA_TEMPLATES.get("requestbody_dump") if (body and len(body.strip())>0) else FRIDA_TEMPLATES.get("okhttp_log_url")
-            user_js = safe_format(base_tpl, url=url)
+            base_tpl = "requestbody_dump" if (body and len(body.strip())>0) else "okhttp_log_url"
+            user_js = render_template_external(base_tpl, {"url": url})
         else:
-            user_js = FRIDA_TEMPLATES.get("okhttp_log_url")
+            user_js = render_template_external("okhttp_log_url", {})
     except Exception as e:
         logging.error("prepare script failed: %s", traceback.format_exc())
-        return jsonify({"error":"prepare script failed", "detail": str(e)}), 500
+        return jsonify({"error":"prepare script failed", "detail": str(e)}), 400
 
-    # 2) 和命令行一致：用 setImmediate + Java.perform 包裹（模板内部即便再 Java.perform 也没关系）
+    # 2) 和命令行一致：用 setImmediate + Java.perform 包裹
     wrapped_no_console = (
         "setImmediate(function(){\n"
         "  try {\n"
@@ -1094,7 +776,7 @@ def run_frida():
         "});\n"
     )
 
-    # 3) 将脚本写入磁盘（给 CLI fallback 用）；注：文件里包含 CONSOLE_WRAPPER 以把 send/console 透到前端
+    # 3) 将脚本写入磁盘（CLI fallback 用）
     script_name = f"frida_{session_id or 'manual'}_{int(time.time())}.js"
     script_path = os.path.join(FRIDA_DIR, script_name)
     try:
@@ -1116,10 +798,6 @@ def run_frida():
         return None
 
     def _find_by_ps(package: str):
-        """
-        解析 `frida-ps -Uai`，返回 (pid, pretty_name, err)。
-        pretty_name 是第二列（命令行你用 -n 的那个名字，比如 'Demo'）。
-        """
         try:
             ps = subprocess.run(["frida-ps", "-Uai"], capture_output=True, text=True, timeout=6)
             if ps.returncode != 0:
@@ -1131,7 +809,7 @@ def run_frida():
                 parts = s.split()
                 if len(parts) < 2:
                     continue
-                if package == parts[-1]:  # 最后一列是包名
+                if package == parts[-1]:
                     pid = None
                     for tok in parts:
                         if tok.isdigit():
@@ -1142,11 +820,11 @@ def run_frida():
         except Exception as e:
             return (None, None, str(e))
 
-    # 4) 是否“需要 Java” —— 只要脚本包含 Java 关键字，就默认需要；则优先走 CLI（与手工一致）
+    # 4) 判定是否需要 Java（保持原逻辑）
     need_java = ("Java" in user_js) or ("java." in user_js.lower())
     prefer_cli = force_cli or need_java
 
-    # 5) 如果不强制 CLI，且允许用 frida‑python，则尝试 API（我们也会在 API 里严选设备 + runtime=v8）
+    # 5) 优先 frida-python
     if FRIDA_PY_AVAILABLE and not prefer_cli:
         try:
             exact_pid = _pidof_exact(target_app)
@@ -1162,7 +840,7 @@ def run_frida():
 
             res = _start_frida_via_api_sync(
                 target_app=target_app,
-                script_text=wrapped_no_console,  # 已含 setImmediate + Java.perform
+                script_text=wrapped_no_console,
                 use_spawn=use_spawn,
                 attach_pid=exact_pid,
                 attach_name=pretty_name
@@ -1174,7 +852,7 @@ def run_frida():
             logging.error("frida api path failed: %s", traceback.format_exc())
             # 继续走 CLI fallback
 
-    # 6) CLI fallback（或强制 CLI / 需要 Java 的情况）：优先 -n 真实进程名，其次 -p，再不行才 -f
+    # 6) CLI fallback
     try:
         check = subprocess.run(["frida", "--version"], capture_output=True, text=True, timeout=5)
         if check.returncode != 0:
@@ -1189,7 +867,6 @@ def run_frida():
 
     cmd = ["frida", "-U"]
     if not spawn:
-        # 模拟你命令行的成功方式：优先用 -n 真实进程名
         if pretty_name:
             socketio.emit("frida_log", {"pid": -1, "line": f"[cli] attach -n {pretty_name} -l {os.path.basename(script_path)}"})
             cmd += ["-n", pretty_name, "-l", script_path]
@@ -1197,7 +874,6 @@ def run_frida():
             socketio.emit("frida_log", {"pid": -1, "line": f"[cli] attach -p {exact_pid} -l {os.path.basename(script_path)}"})
             cmd += ["-p", str(exact_pid), "-l", script_path]
         else:
-            # 退一步用 -f（会重启 app）
             socketio.emit("frida_log", {"pid": -1, "line": f"[cli] spawn -f {target_app} -l {os.path.basename(script_path)} (pid/name unresolved)"} )
             cmd += ["-f", target_app, "-l", script_path]
     else:
@@ -1206,8 +882,6 @@ def run_frida():
 
     res = _start_frida_via_subprocess(cmd, script_path)
     return (jsonify(res), 200) if res.get("status") == "ok" else (jsonify(res), 500)
-
-
 
 
 @app.route('/api/run_frida_custom', methods=['POST'])
@@ -1225,9 +899,6 @@ def run_frida_custom():
     if len(script_text) > 200_000:
         return jsonify({"error":"script too large"}), 400
 
-    # IMPORTANT: write the user's original script exactly as-is to file for CLI.
-    # Do NOT prepend the CONSOLE_WRAPPER here, because the CLI output (console.log,
-    # Java.perform logs, etc.) is what we want forwarded verbatim.
     script_name = f"frida_custom_{int(time.time())}_{uuid.uuid4().hex[:8]}.js"
     script_path = os.path.join(FRIDA_DIR, script_name)
     try:
@@ -1237,7 +908,6 @@ def run_frida_custom():
         logging.error("write custom script failed: %s\n%s", e, traceback.format_exc())
         return jsonify({"error":"write script failed", "detail": str(e)}), 500
 
-    # Ensure frida CLI exists
     try:
         check = subprocess.run(["frida", "--version"], capture_output=True, text=True, timeout=5)
         if check.returncode != 0:
@@ -1245,7 +915,6 @@ def run_frida_custom():
     except Exception as e:
         return jsonify({"error":"frida cli check failed", "detail": str(e)}), 500
 
-    # Detect whether target process is already running
     try:
         ps = subprocess.run(["frida-ps", "-Uai"], capture_output=True, text=True, timeout=8)
         p_stdout = ps.stdout or ""
@@ -1253,22 +922,17 @@ def run_frida_custom():
     except Exception:
         proc_found = False
 
-    # Decide: spawn if user requested spawn OR process not found; otherwise attach by name.
     if spawn:
         use_spawn = True
     else:
         use_spawn = not proc_found
 
-    # Build CLI command to match the command you run locally.
     cmd = ["frida", "-U"]
     if use_spawn:
-        # spawn like: frida -U -f com.example.re -l script.js
         cmd += ["-f", target_app, "-l", script_path]
     else:
-        # attach by name (non-spawn). Use -n (attach by name) if supported.
         cmd += ["-n", target_app, "-l", script_path]
 
-    # Start the process and forward CLI stdout/stderr to frontend.
     res = _start_frida_via_subprocess(cmd, script_path)
     return jsonify(res), 200 if res.get("status") == "ok" else 500
 
@@ -1284,17 +948,16 @@ def inject_frida():
     if not target_app or not template_name:
         return jsonify({"error": "Missing app or template"}), 400
 
-    # 渲染模板
-    tpl = FRIDA_TEMPLATES.get(template_name)
-    if not tpl:
-        return jsonify({"error":"template not found"}), 404
-    user_script = safe_format(tpl, **params)
+    # 渲染模板（改：外置）
+    try:
+        user_script = render_template_external(template_name, params)
+    except Exception as e:
+        return jsonify({"error": "template render failed", "detail": str(e)}), 400
 
-    # 拼接 wrapper: 等待 Java + console 重定向
+    # wrapper: 等待 Java + console 重定向
     wrapped = wrap_user_script_wait_java(user_script)
     final_script = CONSOLE_WRAPPER + "\n" + wrapped
 
-    # 保存脚本以便 CLI fallback
     script_path = os.path.join(FRIDA_DIR, f"inject_{template_name}_{int(time.time())}.js")
     with open(script_path, "w", encoding="utf-8") as f:
         f.write(final_script)
@@ -1310,7 +973,6 @@ def inject_frida():
         cmd += ["-n", target_app, "-l", script_path]
     result = _start_frida_via_subprocess(cmd, script_path)
     return jsonify(result), 200 if result.get('status') == 'ok' else 500
-
 
 
 # ------------------ stop/unload frida session ------------------
@@ -1335,7 +997,6 @@ def stop_frida():
             except Exception:
                 pass
             try:
-                # optionally kill spawned process? Not doing that by default.
                 pass
             except Exception:
                 pass
@@ -1359,5 +1020,5 @@ def index():
 # ------------------ 启动 ------------------
 if __name__ == "__main__":
     logging.info("Starting Flask-SocketIO app; DB=%s LOG=%s FRIDA_PY=%s", DB, LOGFILE, FRIDA_PY_AVAILABLE)
-    # run with threading async mode
+    load_templates()  # 启动时扫描一次（仍支持运行中热加载）
     socketio.run(app, host="0.0.0.0", port=5000, debug=False)
