@@ -8,73 +8,263 @@
 <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
 <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 <style>
-  /* 全局微调 */
-  body { background: #f5f7fb; color: #222; }
-  h4 { letter-spacing: .2px; }
-  /* 卡片与表格 */
-  .card { box-shadow: 0 6px 18px rgba(20,30,50,0.06); border: 0; }
-  .table tbody tr { cursor: pointer; }
-  .suspicious { display:inline-block; margin-right:6px; }
-  .badge-susp { background: linear-gradient(90deg,#ff6b6b,#ff8a80); color:#fff; font-weight:600; padding:0.25rem 0.45rem; border-radius:0.35rem; font-size:0.82rem; }
-  .badge-info-field { background:#e7f3ff; color:#0b62a4; border:1px solid rgba(11,98,164,0.08); padding:0.25rem 0.45rem; border-radius:0.35rem; }
+  /* -----------------------------
+     Design tokens (CSS variables)
+     ----------------------------- */
+  :root {
+    /* colors */
+    --bg:            #f5f7fb;
+    --surface:       rgba(255,255,255,0.78);       /* glass */
+    --surface-plain: #ffffff;                      /* fallback */
+    --surface-border:#e8ecf3;
+    --text:          #1b2430;
+    --muted:         #6b7280;
+    --primary:       #2563eb;
+    --primary-ink:   #ffffff;
+    --success:       #16a34a;
+    --warning:       #d97706;
+    --danger:        #dc2626;
+    --info:          #0ea5e9;
 
-  /* 控制台（放大优化） */
-  #consoleOutput {
-    background: #0b0f12;
-    color: #9cff9c;
-    height: 360px;               /* 默认更大 */
+    /* chips */
+    --chip-danger-from:#ef4444;
+    --chip-danger-to:  #f97316;
+
+    /* console */
+    --console-bg:    #0b0f12;
+    --console-fg:    #c9ffd0;
+    --console-dim:   #8aa39a;
+
+    /* shapes & motion */
+    --radius-sm:     8px;
+    --radius:        12px;
+    --radius-lg:     18px;
+    --shadow-1:      0 6px 18px rgba(20,30,50,0.08);
+    --shadow-2:      0 12px 30px rgba(20,30,50,0.14);
+    --blur:          10px;
+
+    /* misc */
+    --sticky-shadow: 0 6px 10px -6px rgba(15,23,42,0.12);
+    --focus-ring:    0 0 0 3px rgba(37,99,235,0.35);
+  }
+
+  /* Dark scheme */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:            #0c111b;
+      --surface:       rgba(18,23,32,0.72);
+      --surface-plain: #121820;
+      --surface-border:#212a39;
+      --text:          #e6e7ea;
+      --muted:         #9aa4b2;
+      --primary:       #67a1ff;
+      --primary-ink:   #0b0f12;
+      --success:       #34d399;
+      --warning:       #f59e0b;
+      --danger:        #fb7185;
+      --info:          #38bdf8;
+
+      --console-bg:    #0a0f14;
+      --console-fg:    #bdfcc4;
+      --console-dim:   #7aa092;
+
+      --sticky-shadow: 0 6px 10px -6px rgba(0,0,0,0.35);
+      --focus-ring:    0 0 0 3px rgba(103,161,255,0.45);
+    }
+  }
+
+  /* Reduced motion */
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+
+  /* -----------------------------
+     Base
+     ----------------------------- */
+  html, body { height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(37,99,235,0.06), transparent 60%),
+      radial-gradient(800px 400px at 90% 0%, rgba(56,189,248,0.06), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  h4 { letter-spacing: .2px; }
+
+  /* -----------------------------
+     Card (glass fallback)
+     ----------------------------- */
+  .card {
+    border: 1px solid var(--surface-border);
+    background: var(--surface-plain);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-1);
+    transition: transform .18s ease, box-shadow .18s ease, background .18s ease, border-color .18s ease;
+    animation: fadeSlide .35s ease both;
+  }
+  @supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+    .card {
+      background: var(--surface);
+      -webkit-backdrop-filter: saturate(160%) blur(var(--blur));
+      backdrop-filter: saturate(160%) blur(var(--blur));
+      border-color: transparent;
+    }
+  }
+  .card:hover { transform: translateY(-2px); box-shadow: var(--shadow-2); }
+
+  /* -----------------------------
+     Table
+     ----------------------------- */
+  .table { --bs-table-bg: transparent; }
+  .table tbody tr { cursor: pointer; transition: background-color .15s ease; }
+  .table tbody tr:hover { background: rgba(37,99,235,0.06); }
+  .table thead.table-light { background: rgba(148,163,184,0.12); }
+  .table thead.table-light.sticky-top { box-shadow: var(--sticky-shadow); }
+  .session-row:hover { background: rgba(37,99,235,0.06); }
+
+  /* -----------------------------
+     Badges / chips
+     ----------------------------- */
+  .suspicious { display:inline-block; margin-right:6px; }
+  .badge-susp {
+    background: linear-gradient(90deg,var(--chip-danger-from),var(--chip-danger-to));
+    color:#fff; font-weight:700;
+    padding:0.28rem 0.5rem; border-radius:0.42rem; font-size:0.8rem; letter-spacing:.2px;
+    box-shadow: 0 2px 6px rgba(251,113,133,.35);
+  }
+  .badge-info-field {
+    background: rgba(2,132,199,.12);
+    color:#0b62a4;
+    border:1px solid rgba(2,132,199,.22);
+    padding:0.25rem 0.45rem; border-radius:0.35rem;
+  }
+
+  /* -----------------------------
+     Toolbar & secondary text
+     ----------------------------- */
+  .toolbar-btn { min-width: 44px; }
+  .console-controls .btn { min-width: 40px; }
+  .muted-small { font-size: 0.85rem; color: var(--muted); }
+
+  /* -----------------------------
+     Console
+     ----------------------------- */
+  #consoleOutput{
+    background: var(--console-bg);
+    color: var(--console-fg);
+    height: 360px;
     overflow:auto;
     padding: 12px;
-    border-radius:6px;
+    border-radius: var(--radius);
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Mono", "Segoe UI Mono", "Roboto Mono", monospace;
-    font-size: 12px;
-    line-height: 1.4;
-    white-space: pre-wrap;
-    word-break: break-word;
-    resize: vertical;            /* 允许拖动改变高度 */
-    min-height: 160px;
-    transition: height .18s ease-in-out;
+    font-size:12px; line-height:1.48; white-space:pre-wrap; word-break:break-word; resize:vertical; min-height:160px;
+    transition: height .18s ease-in-out, box-shadow .18s ease-in-out;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04);
   }
-  .console-controls .btn { min-width: 40px; }
-  .toolbar-btn { min-width: 44px; }
-  .muted-small { font-size: 0.85rem; color:#6c757d; }
-  .action-col { width:140px; }
-  .session-row:hover { background:#f1f7ff; }
+  #consoleOutput .dim { color: var(--console-dim); }
 
-  /* 右侧 detail 区 */
+  .expanded-console {
+    height: calc(95vh - 130px) !important;
+    z-index: 1050;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.35);
+  }
+
+  /* -----------------------------
+     Detail Panel
+     ----------------------------- */
   .detail-card { max-height: 88vh; overflow:auto; padding-bottom:8px; }
-  .label-strong { font-weight:600; }
-  .banner-error { background:#ffe3e3; border:1px solid #ffbcbc; padding:8px 12px; border-radius:6px; color:#8a1f1f; margin-bottom:10px; }
-
-  /* 详情中长文本滚动 */
+  .label-strong { font-weight:700; }
+  .banner-error {
+    background: #ffe3e3; border:1px solid #ffbcbc; padding:8px 12px;
+    border-radius: var(--radius); color:#8a1f1f; margin-bottom:10px;
+  }
   pre#detailHeaders, pre#detailBody {
-    background: #f8f9fa;
-    border-radius:6px;
-    padding:10px;
-    max-height:160px;
-    overflow:auto;
-    white-space: pre-wrap;
-    word-break: break-word;
+    background: rgba(148,163,184,0.12);
+    border-radius: var(--radius);
+    padding:10px; max-height:160px; overflow:auto;
+    white-space: pre-wrap; word-break: break-word;
+    box-shadow: inset 0 0 0 1px rgba(148,163,184,0.25);
   }
 
-  /* 自定义脚本文本域（更高并可缩放） */
-  #customScript { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace; font-size:13px; background:#fff; resize: vertical; min-height:160px; }
-
-  /* 左侧列表自适应高度 */
+  /* -----------------------------
+     Layout helpers
+     ----------------------------- */
   #leftListWrapper { max-height:88vh; overflow:auto; }
+  .action-col { width:140px; }
 
-  /* 小屏适配 */
+  /* -----------------------------
+     Inputs / focus-visible
+     ----------------------------- */
+  input.form-control, select.form-select, textarea.form-control {
+    border-radius: var(--radius-sm);
+    border-color: var(--surface-border);
+    transition: box-shadow .15s ease, border-color .15s ease, background .15s ease;
+    background: rgba(255,255,255,0.9);
+  }
+  @media (prefers-color-scheme: dark) {
+    input.form-control, select.form-select, textarea.form-control {
+      background: rgba(255,255,255,0.06);
+      color: var(--text);
+    }
+  }
+  .form-control:focus, .form-select:focus, .btn:focus, .btn:focus-visible {
+    box-shadow: var(--focus-ring) !important;
+    border-color: transparent;
+    outline: none;
+  }
+
+  /* Buttons emphasis (keep Bootstrap semantics) */
+  .btn-success { color: #fff; }
+  .btn-outline-primary { color: var(--primary); border-color: var(--primary); }
+  .btn-outline-primary:hover { background: var(--primary); color: var(--primary-ink); }
+  .btn-info { color:#fff; }
+
+  /* Tabs underline accent */
+  .nav-tabs .nav-link { border: 0; color: var(--muted); font-weight:600; }
+  .nav-tabs .nav-link.active {
+    color: var(--text);
+    border-bottom: 2px solid var(--primary);
+    background: transparent;
+  }
+
+  /* Sticky table head top pin */
+  .table-light.sticky-top { top: 0; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+
+  /* -----------------------------
+     Scrollbars
+     ----------------------------- */
+  * { scrollbar-color: rgba(148,163,184,.5) transparent; scrollbar-width: thin; }
+  ::-webkit-scrollbar { height: 10px; width: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, rgba(148,163,184,.55), rgba(71,85,105,.55));
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: linear-gradient(180deg, rgba(148,163,184,.8), rgba(71,85,105,.8)); }
+
+  /* -----------------------------
+     Micro animations
+     ----------------------------- */
+  @keyframes fadeSlide {
+    from { opacity:0; transform: translateY(6px); }
+    to   { opacity:1; transform: translateY(0); }
+  }
+
+  /* -----------------------------
+     Responsive
+     ----------------------------- */
   @media (max-width: 900px) {
     #consoleOutput { height: 220px; }
     .action-col { width:120px; }
     pre#detailHeaders, pre#detailBody { max-height:120px; }
   }
 
-  /* 控制台展开样式 */
-  .expanded-console { height: calc(95vh - 130px) !important; z-index: 1050; box-shadow: 0 10px 40px rgba(0,0,0,0.35); }
-
-  /* custom script textarea */
-  #customScript { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace; font-size:13px; background:#fff; }
+  /* Keep existing helpers consistent (overrides from legacy styles) */
+  .suspicious { margin-right:6px; }
 </style>
 </head>
 <body>
@@ -169,6 +359,8 @@
                       <option value="search_jwt_in_static_strings">Search JWT in static strings</option>
                       <option value="ssl_pinning_bypass">SSL Pinning Bypass</option>
                       <option value="sharedprefs_dump">Dump SharedPreferences</option>
+                      <option value="detect_ssl_pinning">Detect SSL Pinning（仅检测不绕过）</option>
+
                     </select>
                   </div>
                   <div class="col-md-5">
@@ -215,11 +407,21 @@
 
         <hr>
 
-        <div class="d-flex justify-content-between align-items-center mb-2">
-          <div><label class="label-strong">控制台输出（Frida / 后端 / Probe）</label></div>
-          <div class="console-controls">
-            <button id="clearConsoleBtn" class="btn btn-sm btn-outline-secondary me-1" title="清空控制台"><i class="bi bi-x-circle"></i></button>
-            <button id="copyConsoleBtn" class="btn btn-sm btn-outline-secondary me-1" title="复制控制台全部内容"><i class="bi bi-clipboard"></i></button>
+        <!-- ★★ 控制台工具条：新增“视图范围/清空当前/下载当前” -->
+        <div class="d-flex flex-wrap justify-content-between align-items-center mb-2 gap-2">
+          <div class="d-flex align-items-center gap-2">
+            <label class="label-strong me-2 mb-0">控制台输出</label>
+            <select id="consoleScopeSelect" class="form-select form-select-sm" style="width:auto;">
+              <option value="current">当前会话</option>
+              <option value="all">全部日志</option>
+            </select>
+            <span id="consoleScopeHint" class="text-muted small"></span>
+          </div>
+          <div class="console-controls d-flex gap-2">
+            <button id="clearCurrentConsoleBtn" class="btn btn-sm btn-outline-secondary" title="清空当前会话日志"><i class="bi bi-trash3"></i></button>
+            <button id="downloadCurrentConsoleBtn" class="btn btn-sm btn-outline-secondary" title="下载当前会话日志"><i class="bi bi-download"></i></button>
+            <button id="clearConsoleBtn" class="btn btn-sm btn-outline-secondary" title="清空全部日志"><i class="bi bi-x-circle"></i></button>
+            <button id="copyConsoleBtn" class="btn btn-sm btn-outline-secondary" title="复制当前可见日志"><i class="bi bi-clipboard"></i></button>
             <button id="toggleConsoleSizeBtn" class="btn btn-sm btn-outline-secondary" title="放大/还原 控制台"><i class="bi bi-arrows-fullscreen"></i></button>
           </div>
         </div>
@@ -235,304 +437,317 @@
 */
 const API_BASE = `${location.protocol}//${location.host}/api`;
 const POLL_INTERVAL = 5000; // 毫秒：轮询间隔（用于在 socket 丢失时仍能刷新）
+const GLOBAL_ID = "__GLOBAL__";
 let currentId = null;
 const socket = io(); // 使用默认 connect 到同 origin 的 socket.io
 
-// small helpers for UI
+/* ------ 日志缓冲 & 关联（保持你的逻辑） ------ */
+const consoleBuffers = { [GLOBAL_ID]: [] };
+const pidToSession = {};
+function appendToBuffer(line, sid) {
+  const id = sid || GLOBAL_ID;
+  if (!consoleBuffers[id]) consoleBuffers[id] = [];
+  consoleBuffers[id].push(`[${new Date().toLocaleTimeString()}] ${line}`);
+  if (consoleBuffers[id].length > 5000) consoleBuffers[id].splice(0, consoleBuffers[id].length - 5000);
+}
+function renderConsole() {
+  const scope = document.getElementById('consoleScopeSelect').value;
+  const viewId = (scope === 'all') ? GLOBAL_ID : (currentId || GLOBAL_ID);
+  const buf = consoleBuffers[viewId] || [];
+  const el = document.getElementById("consoleOutput");
+  el.textContent = buf.join("\n") + (buf.length ? "\n" : "");
+  el.scrollTop = el.scrollHeight;
+  const hint = document.getElementById('consoleScopeHint');
+  hint.textContent = (scope === 'all') ? "（显示全部日志）" : (currentId ? `（会话：${currentId}）` : "（当前无选中会话，显示全局）");
+}
+
+/* ------ UI helpers ------ */
 function showDebugBanner(msg) {
   const b = document.getElementById('debugBanner');
   if (!msg) { b.style.display='none'; b.innerText=''; return; }
   b.style.display='block'; b.innerText = msg;
 }
-
 function setSocketStatus(s) {
   try { document.getElementById('socketStatus').innerText = 'socket: ' + s; } catch(e) {}
 }
 
-// socket events
+/* ------ sockets ------ */
 socket.on("connect", ()=> {
-    appendConsole("[socket] connected");
-    setSocketStatus("connected");
-    showDebugBanner("");
-    loadSessions(document.getElementById("searchInput").value.trim());
+  appendToBuffer("[socket] connected", GLOBAL_ID);
+  setSocketStatus("connected");
+  showDebugBanner("");
+  loadSessions(document.getElementById("searchInput").value.trim());
+  renderConsole();
 });
 socket.on("connect_error", (err) => {
-    appendConsole("[socket] connect_error: " + err);
-    setSocketStatus("connect_error");
-    showDebugBanner("WebSocket 连接失败，界面将通过轮询更新。请检查后端 socket 支持 (Flask-SocketIO)。");
+  appendToBuffer("[socket] connect_error: " + err, GLOBAL_ID);
+  setSocketStatus("connect_error");
+  showDebugBanner("WebSocket 连接失败，界面将通过轮询更新。请检查后端 socket 支持 (Flask-SocketIO)。");
+  renderConsole();
 });
 socket.on("disconnect", (reason) => {
-    appendConsole("[socket] disconnected: " + reason);
-    setSocketStatus("disconnected");
-    showDebugBanner("WebSocket 已断开，界面将通过轮询更新。");
+  appendToBuffer("[socket] disconnected: " + reason, GLOBAL_ID);
+  setSocketStatus("disconnected");
+  showDebugBanner("WebSocket 已断开，界面将通过轮询更新。");
+  renderConsole();
+});
+socket.on("frida_started", info => {
+  appendToBuffer(`[frida_started] pid=${info.pid} script=${info.script}`, GLOBAL_ID);
+  renderConsole();
+});
+socket.on("frida_log", msg => {
+  const line = msg.line || JSON.stringify(msg);
+  const sid = pidToSession[msg.pid] || GLOBAL_ID;
+  appendToBuffer(line, sid);
+  appendToBuffer(line, GLOBAL_ID);
+  renderConsole();
 });
 socket.on("session_new", data => {
-    appendConsole("[socket] session_new: " + (data && data.id ? data.id : JSON.stringify(data)));
-    // 新会话到达后立即刷新列表
-    loadSessions(document.getElementById("searchInput").value.trim());
+  appendToBuffer("[socket] session_new: " + (data && data.id ? data.id : JSON.stringify(data)), GLOBAL_ID);
+  loadSessions(document.getElementById("searchInput").value.trim());
+  renderConsole();
 });
 socket.on("sessions_cleared", ()=> {
-    document.querySelector("#sessionTable tbody").innerHTML = "";
-    document.getElementById("sessionDetail").style.display = "none";
-    document.getElementById("noSelection").style.display = "block";
-    document.getElementById("statusInfo").textContent = "会话总数: 0";
-    appendConsole("[socket] sessions_cleared");
+  document.querySelector("#sessionTable tbody").innerHTML = "";
+  document.getElementById("sessionDetail").style.display = "none";
+  document.getElementById("noSelection").style.display = "block";
+  document.getElementById("statusInfo").textContent = "会话总数: 0";
+  appendToBuffer("[socket] sessions_cleared", GLOBAL_ID);
+  renderConsole();
 });
-socket.on("frida_log", msg => appendConsole(msg.line || JSON.stringify(msg)));
-socket.on("frida_started", info => appendConsole("[frida_started] pid=" + info.pid + " script=" + info.script));
 
-// load sessions and fill table
+/* ------ 列表加载 ------ */
 async function loadSessions(q="") {
-    try {
-        const url = q ? `${API_BASE}/sessions?q=${encodeURIComponent(q)}` : `${API_BASE}/sessions`;
-        const res = await fetch(url, {cache: "no-store"});
-        if (!res.ok) {
-            appendConsole("[loadSessions] · HTTP " + res.status + " " + res.statusText + " for " + url);
-            if (res.status === 404) {
-                showDebugBanner(`接口未找到 (404): ${url}。请确认后端在此地址提供 /api/sessions（查看 app.py 中路由）。`);
-            } else {
-                showDebugBanner(`从后端获取会话失败: HTTP ${res.status}`);
-            }
-            document.getElementById("statusInfo").textContent = "会话总数: —";
-            document.getElementById("emptyListNote").style.display = "block";
-            return;
-        }
-        showDebugBanner("");
-        const sessions = await res.json();
-        const tbody = document.querySelector("#sessionTable tbody");
-        tbody.innerHTML = "";
-        if (!Array.isArray(sessions) || sessions.length === 0) {
-            document.getElementById("emptyListNote").style.display = "block";
-        } else {
-            document.getElementById("emptyListNote").style.display = "none";
-        }
-        sessions.forEach(s => {
-            const tr = document.createElement("tr");
-            tr.className = "session-row";
-            tr.innerHTML = `
-                <td style="width:140px">${escapeHtml(s.time)}</td>
-                <td style="max-width:520px; overflow:hidden; text-overflow:ellipsis;" title="${escapeHtml(s.url)}">${escapeHtml(s.url)}</td>
-                <td style="width:80px">${escapeHtml(s.method)}</td>
-                <td>${(s.suspicious||[]).map(f=>`<span class="badge-susp suspicious" title="${escapeHtml(f)}">${escapeHtml(shortSusp(f))}</span>`).join(' ')}</td>
-                <td class="text-center action-col"><button class="btn btn-sm btn-info" onclick="viewDetail('${s.id}')"><i class="bi bi-eye"></i> 查看</button></td>
-            `;
-            tbody.appendChild(tr);
-        });
-        // update session count
-        document.getElementById("statusInfo").textContent = "会话总数: " + (Array.isArray(sessions) ? sessions.length : 0);
-    } catch (e) {
-        appendConsole("[loadSessions] error: " + e);
-        showDebugBanner("获取会话遇到异常（请检查后端是否可达）：" + e);
+  try {
+    const url = q ? `${API_BASE}/sessions?q=${encodeURIComponent(q)}` : `${API_BASE}/sessions`;
+    const res = await fetch(url, {cache: "no-store"});
+    if (!res.ok) {
+      appendToBuffer("[loadSessions] · HTTP " + res.status + " " + res.statusText + " for " + url, GLOBAL_ID);
+      if (res.status === 404) showDebugBanner(`接口未找到 (404): ${url}。请确认后端在此地址提供 /api/sessions。`);
+      else showDebugBanner(`从后端获取会话失败: HTTP ${res.status}`);
+      document.getElementById("statusInfo").textContent = "会话总数: —";
+      document.getElementById("emptyListNote").style.display = "block";
+      renderConsole();
+      return;
     }
+    showDebugBanner("");
+    const sessions = await res.json();
+    const tbody = document.querySelector("#sessionTable tbody");
+    tbody.innerHTML = "";
+    if (!Array.isArray(sessions) || sessions.length === 0) {
+      document.getElementById("emptyListNote").style.display = "block";
+    } else {
+      document.getElementById("emptyListNote").style.display = "none";
+    }
+    sessions.forEach(s => {
+      const tr = document.createElement("tr");
+      tr.className = "session-row";
+      tr.innerHTML = `
+        <td style="width:140px">${escapeHtml(s.time)}</td>
+        <td style="max-width:520px; overflow:hidden; text-overflow:ellipsis;" title="${escapeHtml(s.url)}">${escapeHtml(s.url)}</td>
+        <td style="width:80px">${escapeHtml(s.method)}</td>
+        <td>${(s.suspicious||[]).map(f=>`<span class="badge-susp suspicious" title="${escapeHtml(f)}">${escapeHtml(shortSusp(f))}</span>`).join(' ')}</td>
+        <td class="text-center action-col"><button class="btn btn-sm btn-info" onclick="viewDetail('${s.id}')"><i class="bi bi-eye"></i> 查看</button></td>
+      `;
+      tbody.appendChild(tr);
+      if (!consoleBuffers[s.id]) consoleBuffers[s.id] = consoleBuffers[s.id] || [];
+    });
+    document.getElementById("statusInfo").textContent = "会话总数: " + (Array.isArray(sessions) ? sessions.length : 0);
+  } catch (e) {
+    appendToBuffer("[loadSessions] error: " + e, GLOBAL_ID);
+  } finally {
+    renderConsole();
+  }
 }
+function shortSusp(s){ if(typeof s!=='string') return s; return s.length>18 ? s.slice(0,15)+'...' : s; }
+function escapeHtml(s){ if(!s && s!==0) return ""; return String(s).replace(/[&<>"']/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
 
-function shortSusp(s) {
-    if (typeof s !== 'string') return s;
-    return s.length > 18 ? s.slice(0,15) + '...' : s;
-}
-
-function escapeHtml(s) {
-    if (!s && s !== 0) return "";
-    return String(s).replace(/[&<>"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]; });
-}
-
-// search input Enter
-document.getElementById("searchInput").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") loadSessions(e.target.value.trim());
-});
+/* ------ 搜索/导出/清空 ------ */
+document.getElementById("searchInput").addEventListener("keydown", (e) => { if (e.key === "Enter") loadSessions(e.target.value.trim()); });
 document.getElementById("exportJsonBtn").onclick = ()=> window.location.href = `${API_BASE}/sessions/export?format=json`;
 document.getElementById("exportCsvBtn").onclick = ()=> window.location.href = `${API_BASE}/sessions/export?format=csv`;
-
-// clear sessions
 document.getElementById("clearSessionsBtn").onclick = async () => {
-    if (!confirm("确定要清空所有会话吗？此操作不可恢复。")) return;
-    const token = prompt("如果已设置 ADMIN_TOKEN，请输入（直接回车则空）:");
-    const headers = token ? {"X-ADMIN-TOKEN": token} : {};
-    try {
-        const r = await fetch(`${API_BASE}/clear_sessions`, { method:"POST", headers });
-        const j = await r.json().catch(()=> ({}));
-        if (r.status === 200 && j.status === "ok") {
-            alert("已清空");
-            loadSessions();
-        } else {
-            alert("清空失败: " + JSON.stringify(j));
-            appendConsole("[clear_sessions] failed: " + JSON.stringify(j));
-        }
-    } catch (e) {
-        appendConsole("[clear_sessions] error: " + e);
-        alert("清空遇到错误: " + e);
+  if (!confirm("确定要清空所有会话吗？此操作不可恢复。")) return;
+  const token = prompt("如果已设置 ADMIN_TOKEN，请输入（直接回车则空）:");
+  const headers = token ? {"X-ADMIN-TOKEN": token} : {};
+  try {
+    const r = await fetch(`${API_BASE}/clear_sessions`, { method:"POST", headers });
+    const j = await r.json().catch(()=> ({}));
+    if (r.status === 200 && j.status === "ok") {
+      alert("已清空");
+      Object.keys(consoleBuffers).forEach(k => { if (k !== GLOBAL_ID) delete consoleBuffers[k]; });
+      loadSessions();
+    } else {
+      alert("清空失败: " + JSON.stringify(j));
+      appendToBuffer("[clear_sessions] failed: " + JSON.stringify(j), GLOBAL_ID);
     }
+  } catch (e) {
+    appendToBuffer("[clear_sessions] error: " + e, GLOBAL_ID);
+    alert("清空遇到错误: " + e);
+  } finally { renderConsole(); }
 };
 
-// view detail
+/* ------ 详情 ------ */
 async function viewDetail(id) {
-    try {
-        currentId = id;
-        const res = await fetch(`${API_BASE}/sessions/${id}`);
-        if (!res.ok) { appendConsole("[viewDetail] fetch error: " + res.status); return; }
-        const session = await res.json();
-        document.getElementById("detailUrl").innerText = session.url;
-        document.getElementById("detailMethod").innerText = session.method;
-        document.getElementById("detailHeaders").innerText = JSON.stringify(session.headers || {}, null, 2);
-        document.getElementById("detailBody").innerText = session.body || "";
-        document.getElementById("sessionDetail").style.display = "block";
-        document.getElementById("noSelection").style.display = "none";
-        // 清空控制台以便观察当前会话输出
-        document.getElementById("consoleOutput").textContent = "";
-        // 自动切换到详情 tab（若不在）
-        const tabEl = document.querySelector('#rightTabs a[href="#tab-detail"]');
-        if (tabEl) new bootstrap.Tab(tabEl).show();
-    } catch (e) {
-        appendConsole("[viewDetail] error: " + e);
-    }
+  try {
+    currentId = id;
+    const res = await fetch(`${API_BASE}/sessions/${id}`);
+    if (!res.ok) { appendToBuffer("[viewDetail] fetch error: " + res.status, GLOBAL_ID); renderConsole(); return; }
+    const session = await res.json();
+    document.getElementById("detailUrl").innerText = session.url;
+    document.getElementById("detailMethod").innerText = session.method;
+    document.getElementById("detailHeaders").innerText = JSON.stringify(session.headers || {}, null, 2);
+    document.getElementById("detailBody").innerText = session.body || "";
+    document.getElementById("sessionDetail").style.display = "block";
+    document.getElementById("noSelection").style.display = "none";
+    renderConsole();
+    const tabEl = document.querySelector('#rightTabs a[href="#tab-detail"]');
+    if (tabEl) new bootstrap.Tab(tabEl).show();
+  } catch (e) {
+    appendToBuffer("[viewDetail] error: " + e, GLOBAL_ID);
+    renderConsole();
+  }
 }
 
-// generate frida
+/* ------ 生成/运行脚本 ------ */
 document.getElementById("generateFridaBtn").onclick = async () => {
-    if (!currentId) return alert("先选择一个会话");
-    try {
-        const r = await fetch(`${API_BASE}/generate_frida`, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({id:currentId})});
-        if (r.status === 200) {
-            const script = await r.text();
-            const blob = new Blob([script], {type:"text/javascript"});
-            const a = document.createElement("a");
-            a.href = URL.createObjectURL(blob);
-            a.download = `frida_${currentId}.js`; a.click();
-            URL.revokeObjectURL(a.href);
-        } else {
-            const txt = await r.text().catch(()=>"");
-            alert("生成失败: " + r.status + " " + txt);
-        }
-    } catch (e) {
-        appendConsole("[generateFrida] error: " + e);
-        alert("生成失败: " + e);
+  if (!currentId) return alert("先选择一个会话");
+  try {
+    const r = await fetch(`${API_BASE}/generate_frida`, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({id:currentId})});
+    if (r.status === 200) {
+      const script = await r.text();
+      const blob = new Blob([script], {type:"text/javascript"});
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `frida_${currentId}.js`; a.click();
+      URL.revokeObjectURL(a.href);
+    } else {
+      const txt = await r.text().catch(()=>"");
+      alert("生成失败: " + r.status + " " + txt);
     }
+  } catch (e) {
+    appendToBuffer("[generateFrida] error: " + e, GLOBAL_ID);
+    alert("生成失败: " + e);
+  } finally { renderConsole(); }
 };
-
-// run frida (use templates / session)
 document.getElementById("runFridaBtn").onclick = async () => {
-    if (!currentId) return alert("先选择一个会话");
-    const appName = prompt("请输入目标 App 包名（例如 com.example.app）:");
-    if (!appName) return;
-    const spawn = document.getElementById("spawnCheckbox").checked;
-    const token = prompt("如果已设置 ADMIN_TOKEN，请输入（直接回车则空）:");
-    const headers = {"Content-Type":"application/json"};
-    if (token) headers["X-ADMIN-TOKEN"] = token;
-    appendConsole("[run_frida] 请求注入: " + appName);
-    try {
-        const r = await fetch(`${API_BASE}/run_frida`, {
-            method:"POST", headers, body: JSON.stringify({id: currentId, app: appName, spawn: spawn})
-        });
-        const j = await r.json().catch(()=>({}));
-        if (r.status === 200 && j.status === "ok") {
-            appendConsole("[run_frida] started pid=" + j.pid);
-        } else {
-            appendConsole("[run_frida] error: " + JSON.stringify(j));
-            alert("运行失败: " + JSON.stringify(j));
-        }
-    } catch (e) {
-        appendConsole("[run_frida] exception: " + e);
-        alert("运行失败: " + e);
+  if (!currentId) return alert("先选择一个会话");
+  const appName = prompt("请输入目标 App 包名（例如 com.example.app）:");
+  if (!appName) return;
+  const spawn = document.getElementById("spawnCheckbox").checked;
+  const token = prompt("如果已设置 ADMIN_TOKEN，请输入（直接回车则空）:");
+  const headers = {"Content-Type":"application/json"}; if (token) headers["X-ADMIN-TOKEN"] = token;
+  appendToBuffer("[run_frida] 请求注入: " + appName, currentId);
+  try {
+    const r = await fetch(`${API_BASE}/run_frida`, {
+      method:"POST", headers, body: JSON.stringify({id: currentId, app: appName, spawn: spawn})
+    });
+    const j = await r.json().catch(()=>({}));
+    if (r.status === 200 && j.status === "ok") {
+      appendToBuffer("[run_frida] started pid=" + j.pid, currentId);
+      pidToSession[j.pid] = currentId;
+    } else {
+      appendToBuffer("[run_frida] error: " + JSON.stringify(j), currentId);
+      alert("运行失败: " + JSON.stringify(j));
     }
+  } catch (e) {
+    appendToBuffer("[run_frida] exception: " + e, currentId);
+    alert("运行失败: " + e);
+  } finally { renderConsole(); }
 };
-
-// run mem template
 document.getElementById("runMemBtn").onclick = async () => {
-    const tpl = document.getElementById("memTemplate").value;
-    const cls = document.getElementById("memClassInput").value.trim();
-    const appName = prompt("请输入目标 App 包名（例如 com.example.app）:");
-    if (!appName) return;
-    const token = prompt("如果已设置 ADMIN_TOKEN，请输入（直接回车则空）:");
-    const headers = {"Content-Type":"application/json"};
-    if (token) headers["X-ADMIN-TOKEN"] = token;
+  const tpl = document.getElementById("memTemplate").value;
+  const cls = document.getElementById("memClassInput").value.trim();
+  const appName = prompt("请输入目标 App 包名（例如 com.example.app）:");
+  if (!appName) return;
+  const token = prompt("如果已设置 ADMIN_TOKEN，请输入（直接回车则空）:");
+  const headers = {"Content-Type":"application/json"}; if (token) headers["X-ADMIN-TOKEN"] = token;
 
-    const body = { app: appName, spawn:false, template: tpl, template_params: {} };
-    if (tpl === "dump_class_string_fields") {
-        if (!cls) return alert("请填写类名，例如 com.example.app.LoginManager");
-        body.template_params = { class_name: cls };
+  const body = { app: appName, spawn:false, template: tpl, template_params: {} };
+  if (tpl === "dump_class_string_fields") {
+    if (!cls) return alert("请填写类名，例如 com.example.app.LoginManager");
+    body.template_params = { class_name: cls };
+  }
+  try {
+    const r = await fetch(`${API_BASE}/run_frida`, { method:"POST", headers, body: JSON.stringify(body) });
+    const j = await r.json().catch(()=>({}));
+    if (r.status===200 && j.status==="ok") {
+      appendToBuffer("[run_template] started pid=" + j.pid + " template=" + tpl, currentId || GLOBAL_ID);
+      pidToSession[j.pid] = currentId || GLOBAL_ID;
+    } else {
+      appendToBuffer("[run_template] error: " + JSON.stringify(j), currentId || GLOBAL_ID);
+      alert("运行失败: " + JSON.stringify(j));
     }
-
-    try {
-        const r = await fetch(`${API_BASE}/run_frida`, { method:"POST", headers, body: JSON.stringify(body) });
-        const j = await r.json().catch(()=>({}));
-        if (r.status===200 && j.status==="ok") {
-            appendConsole("[run_template] started pid=" + j.pid);
-        } else {
-            appendConsole("[run_template] error: " + JSON.stringify(j));
-            alert("运行失败: " + JSON.stringify(j));
-        }
-    } catch (e) {
-        appendConsole("[run_template] exception: " + e);
-        alert("运行失败: " + e);
-    }
+  } catch (e) {
+    appendToBuffer("[run_template] exception: " + e, currentId || GLOBAL_ID);
+    alert("运行失败: " + e);
+  } finally { renderConsole(); }
 };
 
-// probe runner
+/* ------ Probe ------ */
 document.getElementById("runProbeBtn").onclick = async () => {
-    const appName = document.getElementById("probeAppInput").value.trim() || prompt("请输入 Probe 目标包名：");
-    if (!appName) return;
-    const timeout = parseFloat(document.getElementById("probeTimeout").value || "4");
-    const token = prompt("如果已设置 ADMIN_TOKEN，请输入（直接回车则空）:");
-    const headers = {"Content-Type":"application/json"};
-    if (token) headers["X-ADMIN-TOKEN"] = token;
-    appendConsole("[probe] start for " + appName);
-    try {
-        const r = await fetch(`${API_BASE}/probe`, { method:"POST", headers, body: JSON.stringify({ app: appName, timeout: timeout })});
-        const j = await r.json().catch(()=>null);
-        if (r.status === 200 && j) {
-            if (j.matches && Array.isArray(j.matches) && j.matches.length) {
-                appendConsole("[probe matches]\n" + j.matches.join("\n"));
-            } else if (j.found !== undefined) {
-                appendConsole("[probe] found=" + j.found + " raw_count=" + (j.raw_count || 0));
-            } else if (j.stdout) {
-                if (j.stdout) appendConsole("[probe stdout]\n" + j.stdout);
-                if (j.stderr) appendConsole("[probe stderr]\n" + j.stderr);
-            } else {
-                appendConsole("[probe] 返回成功但无可显示字段: " + JSON.stringify(j));
-            }
-        } else {
-            appendConsole("[probe] error: " + JSON.stringify(j || {}));
-            alert("Probe 失败: " + (j ? JSON.stringify(j) : "unknown"));
-        }
-    } catch (e) {
-        appendConsole("[probe] exception: " + e);
-        alert("Probe 异常: " + e);
+  const appName = document.getElementById("probeAppInput").value.trim() || prompt("请输入 Probe 目标包名：");
+  if (!appName) return;
+  const timeout = parseFloat(document.getElementById("probeTimeout").value || "4");
+  const token = prompt("如果已设置 ADMIN_TOKEN，请输入（直接回车则空）:");
+  const headers = {"Content-Type":"application/json"}; if (token) headers["X-ADMIN-TOKEN"] = token;
+  appendToBuffer("[probe] start for " + appName, currentId || GLOBAL_ID);
+  try {
+    const r = await fetch(`${API_BASE}/probe`, { method:"POST", headers, body: JSON.stringify({ app: appName, timeout: timeout })});
+    const j = await r.json().catch(()=>null);
+    if (r.status === 200 && j) {
+      if (j.matches && Array.isArray(j.matches) && j.matches.length) {
+        appendToBuffer("[probe matches]\n" + j.matches.join("\n"), currentId || GLOBAL_ID);
+      } else if (j.found !== undefined) {
+        appendToBuffer("[probe] found=" + j.found + " raw_count=" + (j.raw_count || 0), currentId || GLOBAL_ID);
+      } else if (j.stdout) {
+        if (j.stdout) appendToBuffer("[probe stdout]\n" + j.stdout, currentId || GLOBAL_ID);
+        if (j.stderr) appendToBuffer("[probe stderr]\n" + j.stderr, currentId || GLOBAL_ID);
+      } else {
+        appendToBuffer("[probe] 返回成功但无可显示字段: " + JSON.stringify(j), currentId || GLOBAL_ID);
+      }
+    } else {
+      appendToBuffer("[probe] error: " + JSON.stringify(j || {}), currentId || GLOBAL_ID);
+      alert("Probe 失败: " + (j ? JSON.stringify(j) : "unknown"));
     }
+  } catch (e) {
+    appendToBuffer("[probe] exception: " + e, currentId || GLOBAL_ID);
+    alert("Probe 异常: " + e);
+  } finally { renderConsole(); }
 };
 
-// run custom script (独立接口调用)
+/* ------ 自定义脚本 ------ */
 document.getElementById("runCustomBtn").onclick = async () => {
-    const script = document.getElementById("customScript").value.trim();
-    const appName = document.getElementById("customAppInput").value.trim();
-    const spawn = document.getElementById("customSpawn").checked;
-    if (!script || !appName) return alert("请填写脚本和包名");
-    const token = prompt("如果设置了 ADMIN_TOKEN，请输入（直接回车则空）:") || "";
-    const headers = {"Content-Type":"application/json"};
-    if (token) headers["X-ADMIN-TOKEN"] = token;
-    appendConsole("[run_frida_custom] 请求注入: " + appName);
-    try {
-        const r = await fetch(`${API_BASE}/run_frida_custom`, {
-            method:"POST", headers,
-            body: JSON.stringify({ app: appName, script, spawn })
-        });
-        const j = await r.json().catch(()=>{});
-        if (r.status===200 && j && j.status==="ok") {
-            appendConsole("[run_frida_custom] started pid=" + j.pid);
-        } else {
-            appendConsole("[run_frida_custom] error: " + JSON.stringify(j));
-            alert("注入失败: " + JSON.stringify(j));
-        }
-    } catch(e){ appendConsole("[run_frida_custom] exception: " + e); alert("注入异常: " + e); }
+  const script = document.getElementById("customScript").value.trim();
+  const appName = document.getElementById("customAppInput").value.trim();
+  const spawn = document.getElementById("customSpawn").checked;
+  if (!script || !appName) return alert("请填写脚本和包名");
+  const token = prompt("如果设置了 ADMIN_TOKEN，请输入（直接回车则空）:") || "";
+  const headers = {"Content-Type":"application/json"}; if (token) headers["X-ADMIN-TOKEN"] = token;
+  appendToBuffer("[run_frida_custom] 请求注入: " + appName, currentId || GLOBAL_ID);
+  try {
+    const r = await fetch(`${API_BASE}/run_frida_custom`, {
+      method:"POST", headers, body: JSON.stringify({ app: appName, script, spawn })
+    });
+    const j = await r.json().catch(()=>{});
+    if (r.status===200 && j && j.status==="ok") {
+      appendToBuffer("[run_frida_custom] started pid=" + j.pid, currentId || GLOBAL_ID);
+      pidToSession[j.pid] = currentId || GLOBAL_ID;
+    } else {
+      appendToBuffer("[run_frida_custom] error: " + JSON.stringify(j), currentId || GLOBAL_ID);
+      alert("注入失败: " + JSON.stringify(j));
+    }
+  } catch(e){
+    appendToBuffer("[run_frida_custom] exception: " + e, currentId || GLOBAL_ID);
+    alert("注入异常: " + e);
+  } finally { renderConsole(); }
 };
-
-// 填充示例脚本
 document.getElementById("fillExampleBtn").onclick = () => {
-    const example = `// 示例：打印应用包名 + hook okhttp 请求
+  const example = `// 示例：打印应用包名 + hook okhttp 请求
 Java.perform(function(){
   try {
     console.log("[example] Java runtime OK");
     var OkHttpClient = Java.use('okhttp3.OkHttpClient');
-    var Buffer = Java.use('okio.Buffer');
     var newCall = OkHttpClient.newCall.overload('okhttp3.Request');
     newCall.implementation = function(request){
       try {
@@ -544,60 +759,58 @@ Java.perform(function(){
     };
   } catch(e){ console.log("[example] err", e); }
 });`;
-    document.getElementById("customScript").value = example;
+  document.getElementById("customScript").value = example;
 };
 
-// append console
-function appendConsole(s) {
-    try {
-        const el = document.getElementById("consoleOutput");
-        el.textContent += "[" + new Date().toLocaleTimeString() + "] " + s + "\n";
-        el.scrollTop = el.scrollHeight;
-        console.log(s);
-    } catch (e) { console.log("appendConsole err:", e, s); }
+/* ------ 控制台工具 ------ */
+function copyVisibleConsole() {
+  const txt = document.getElementById("consoleOutput").textContent;
+  navigator.clipboard?.writeText(txt).then(
+    ()=> appendToBuffer("[console copied]", GLOBAL_ID),
+    ()=> appendToBuffer("[console copy failed]", GLOBAL_ID)
+  );
+  renderConsole();
 }
-
-function copyConsole() {
-    try {
-        const txt = document.getElementById("consoleOutput").textContent;
-        navigator.clipboard?.writeText(txt).then(()=> appendConsole("[console copied]"), ()=> appendConsole("[console copy failed]"));
-    } catch (e) { appendConsole("[copyConsole] error: " + e); }
-}
-
-// 控制台按钮绑定
-document.getElementById('clearConsoleBtn').addEventListener('click', ()=> { document.getElementById('consoleOutput').textContent = ''; });
-document.getElementById('copyConsoleBtn').addEventListener('click', copyConsole);
-
-// 控制台放大/还原
-const toggleConsoleBtn = document.getElementById('toggleConsoleSizeBtn');
-toggleConsoleBtn.addEventListener('click', ()=> {
-    const el = document.getElementById('consoleOutput');
-    const icon = toggleConsoleBtn.querySelector('i');
-    if (el.classList.contains('expanded-console')) {
-        el.classList.remove('expanded-console');
-        icon.className = 'bi bi-arrows-fullscreen';
-        toggleConsoleBtn.title = '放大/还原 控制台';
-    } else {
-        el.classList.add('expanded-console');
-        icon.className = 'bi bi-fullscreen-exit';
-        toggleConsoleBtn.title = '还原 控制台';
-        // 确保滚动到最底
-        setTimeout(()=> el.scrollTop = el.scrollHeight, 50);
-    }
+document.getElementById('copyConsoleBtn').addEventListener('click', copyVisibleConsole);
+document.getElementById('clearConsoleBtn').addEventListener('click', ()=>{
+  if (!confirm("确定要清空【全部日志】缓冲吗？")) return;
+  consoleBuffers[GLOBAL_ID] = [];
+  renderConsole();
 });
+document.getElementById('clearCurrentConsoleBtn').addEventListener('click', ()=>{
+  const scope = document.getElementById('consoleScopeSelect').value;
+  const target = (scope==='all') ? GLOBAL_ID : (currentId || GLOBAL_ID);
+  consoleBuffers[target] = [];
+  renderConsole();
+});
+document.getElementById('downloadCurrentConsoleBtn').addEventListener('click', ()=>{
+  const scope = document.getElementById('consoleScopeSelect').value;
+  const target = (scope==='all') ? GLOBAL_ID : (currentId || GLOBAL_ID);
+  const content = (consoleBuffers[target] || []).join("\n");
+  const blob = new Blob([content], {type:"text/plain;charset=utf-8"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (target===GLOBAL_ID ? "console_all.log" : `console_${target}.log`);
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+document.getElementById('consoleScopeSelect').addEventListener('change', renderConsole);
 
-// 双击控制台也可以放大/还原
+/* ------ 控制台放大/还原 ------ */
+const toggleConsoleBtn = document.getElementById('toggleConsoleSizeBtn');
+toggleConsoleBtn.addEventListener('click', ()=>{
+  const el = document.getElementById('consoleOutput'); const icon = toggleConsoleBtn.querySelector('i');
+  if (el.classList.contains('expanded-console')) { el.classList.remove('expanded-console'); icon.className='bi bi-arrows-fullscreen'; }
+  else { el.classList.add('expanded-console'); icon.className='bi bi-fullscreen-exit'; setTimeout(()=> el.scrollTop = el.scrollHeight, 50); }
+});
 document.getElementById('consoleOutput').addEventListener('dblclick', ()=> toggleConsoleBtn.click());
 
-// 轮询以便在 websocket 不可用时仍能更新
+/* ------ 轮询兜底 ------ */
 setInterval(()=> {
-    // only poll when socket is not connected
-    if (!socket || socket.disconnected) {
-        loadSessions(document.getElementById("searchInput").value.trim());
-    }
+  if (!socket || socket.disconnected) loadSessions(document.getElementById("searchInput").value.trim());
 }, POLL_INTERVAL);
 
-// 初次加载
+/* 初次加载 */
 loadSessions();
 </script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/js/bootstrap.bundle.min.js"></script>

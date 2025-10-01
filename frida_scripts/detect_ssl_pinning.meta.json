@@ -1,0 +1,15 @@
+{
+  "display_name": "Detect SSL Pinning (no-bypass)",
+  "required_params": [],
+  "targets": [
+    "okhttp3.CertificatePinner.check",
+    "okhttp3.internal.tls.OkHostnameVerifier.verify",
+    "javax.net.ssl.X509TrustManager.checkServerTrusted",
+    "javax.net.ssl.HttpsURLConnection.setDefaultHostnameVerifier"
+  ],
+  "risks": [
+    "只检测不绕过：不会更改返回值，不影响连接",
+    "若目标使用自研/混淆类名，部分钩子可能不触发"
+  ],
+  "defaults": {}
+}
