@@ -358,37 +358,6 @@ def list_frida_templates():
         })
     return jsonify(out)
 
-# ------------------ generate_frida ------------------
-@app.route('/api/generate_frida', methods=['POST'])
-def generate_frida():
-    data = request.get_json() or {}
-    template_name = data.get("template")
-    params = data.get("template_params") or {}
-    if template_name:
-        try:
-            script = render_template_external(template_name, params)
-            return script, 200
-        except Exception as e:
-            logging.error("generate_frida template render failed: %s", traceback.format_exc())
-            return jsonify({"error":"template render failed", "detail": str(e)}), 400
-
-    session_id = data.get('id')
-    if not session_id:
-        return jsonify({"error":"missing id or template"}), 400
-    conn = db_conn()
-    row = conn.execute("SELECT url, headers, body, suspicious FROM sessions WHERE id=?", (session_id,)).fetchone()
-    conn.close()
-    if not row:
-        return "Session not found", 404
-    url, headers_json, body, suspicious_json = row[0], row[1], row[2], row[3]
-    inferred = "requestbody_dump" if (body and len(body.strip())>0) else "okhttp_log_url"
-    try:
-        frida_script = render_template_external(inferred, {"url": url})
-        return frida_script, 200
-    except Exception as e:
-        logging.error("generate_frida session render failed: %s", traceback.format_exc())
-        return jsonify({"error":"template render failed", "detail": str(e)}), 400
-
 # ------------------ probe endpoint ------------------
 @app.route('/api/probe', methods=['POST'])
 def probe_process():
@@ -414,6 +383,8 @@ def probe_process():
 # ------------------ FRIDA helpers ------------------
 FRIDA_SESSIONS = {}  # pid -> {session, script, device, target}
 FRIDA_SESSIONS_LOCK = threading.Lock()
+FRIDA_CLI_PROCS = {}  # pid -> {"proc": Popen, "script": path}
+FRIDA_CLI_PROCS_LOCK = threading.Lock()
 
 # wrapper to forward console.log/error -> send()
 CONSOLE_WRAPPER = r"""
@@ -482,10 +453,13 @@ def _start_frida_via_subprocess(cmd, script_path):
     as-is so the frontend sees the same output you see when running the CLI locally.
     """
     try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
         pid = p.pid
         logging.info("Started frida subprocess pid=%s cmd=%s", pid, " ".join(cmd))
         socketio.emit("frida_started", {"pid": pid, "script": script_path, "spawn": ("-f" in cmd or "-F" in cmd)})
+
+        with FRIDA_CLI_PROCS_LOCK:
+            FRIDA_CLI_PROCS[pid] = {"proc": p, "script": script_path}
 
         def reader_thread(stream, prefix=""):
             try:
@@ -502,6 +476,18 @@ def _start_frida_via_subprocess(cmd, script_path):
 
         socketio.start_background_task(reader_thread, p.stdout, "")
         socketio.start_background_task(reader_thread, p.stderr, "[ERR] ")
+
+        def wait_thread():
+            try:
+                code = p.wait()
+            except Exception:
+                code = None
+            finally:
+                with FRIDA_CLI_PROCS_LOCK:
+                    FRIDA_CLI_PROCS.pop(pid, None)
+            socketio.emit("frida_stopped", {"pid": pid, "exit_code": code})
+
+        socketio.start_background_task(wait_thread)
 
         return {"status": "ok", "pid": pid, "script": script_path, "spawn": ("-f" in cmd or "-F" in cmd)}
     except Exception as e:
@@ -727,7 +713,6 @@ def wrap_user_script_wait_java(user_js: str, max_attempts: int = 50, delay_ms: i
 @require_token
 def run_frida():
     data = request.get_json() or {}
-    session_id = data.get('id')
     target_app = data.get('app') or data.get('app_name') or data.get('package')
     spawn = bool(data.get('spawn', False))
     template_name = data.get("template")
@@ -737,24 +722,15 @@ def run_frida():
 
     if not target_app:
         return jsonify({"error": "Missing target app"}), 400
+    if not script_override and not template_name:
+        return jsonify({"error": "Missing template or script"}), 400
 
     # 1) 生成 “用户脚本” （改：从外置模板渲染）
     try:
         if script_override:
             user_js = script_override
-        elif template_name:
-            user_js = render_template_external(template_name, params)
-        elif session_id:
-            conn = db_conn()
-            row = conn.execute("SELECT url, headers, body FROM sessions WHERE id=?", (session_id,)).fetchone()
-            conn.close()
-            if not row:
-                return jsonify({"error":"Session not found"}), 404
-            url = row[0]; body = row[2]
-            base_tpl = "requestbody_dump" if (body and len(body.strip())>0) else "okhttp_log_url"
-            user_js = render_template_external(base_tpl, {"url": url})
         else:
-            user_js = render_template_external("okhttp_log_url", {})
+            user_js = render_template_external(template_name, params)
     except Exception as e:
         logging.error("prepare script failed: %s", traceback.format_exc())
         return jsonify({"error":"prepare script failed", "detail": str(e)}), 400
@@ -777,7 +753,7 @@ def run_frida():
     )
 
     # 3) 将脚本写入磁盘（CLI fallback 用）
-    script_name = f"frida_{session_id or 'manual'}_{int(time.time())}.js"
+    script_name = f"frida_{template_name or 'manual'}_{int(time.time())}.js"
     script_path = os.path.join(FRIDA_DIR, script_name)
     try:
         with open(script_path, "w", encoding="utf-8") as f:
@@ -935,6 +911,45 @@ def run_frida_custom():
 
     res = _start_frida_via_subprocess(cmd, script_path)
     return jsonify(res), 200 if res.get("status") == "ok" else 500
+
+
+@app.route('/api/exit_frida_cli', methods=['POST'])
+@require_token
+def exit_frida_cli():
+    data = request.get_json(silent=True) or {}
+    pid = data.get("pid")
+    if pid is None:
+        return jsonify({"error": "missing pid"}), 400
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid pid"}), 400
+
+    with FRIDA_CLI_PROCS_LOCK:
+        info = FRIDA_CLI_PROCS.get(pid)
+    if not info:
+        return jsonify({"error": "pid not tracked"}), 404
+
+    proc = info.get("proc")
+    if proc is None:
+        with FRIDA_CLI_PROCS_LOCK:
+            FRIDA_CLI_PROCS.pop(pid, None)
+        return jsonify({"error": "process handle missing"}), 410
+
+    if proc.poll() is not None:
+        with FRIDA_CLI_PROCS_LOCK:
+            FRIDA_CLI_PROCS.pop(pid, None)
+        return jsonify({"error": "process already exited"}), 410
+
+    try:
+        proc.stdin.write(b"exit\n")
+        proc.stdin.flush()
+    except Exception as e:
+        logging.error("failed to send exit to pid %s: %s", pid, e)
+        return jsonify({"error": "write failed", "detail": str(e)}), 500
+
+    logging.info("Sent exit command to frida subprocess pid=%s", pid)
+    return jsonify({"status": "ok"}), 200
 
 # ------------------ inject_frida API ------------------
 @app.route('/api/inject_frida', methods=['POST'])

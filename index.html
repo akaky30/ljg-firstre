@@ -320,11 +320,6 @@
       <div class="card detail-card p-3">
         <div class="d-flex align-items-center mb-2">
           <h5 class="mb-0 me-2">会话详情</h5>
-          <div class="ms-auto">
-            <button id="generateFridaBtn" class="btn btn-outline-primary btn-sm me-1" title="生成并下载当前会话的 Frida 脚本"><i class="bi bi-download"></i> 脚本</button>
-            <button id="runFridaBtn" class="btn btn-success btn-sm me-1" title="为当前会话生成脚本并运行 Frida"><i class="bi bi-play-fill"></i> 运行</button>
-            <label class="form-check-label ms-1"><input type="checkbox" id="spawnCheckbox" class="form-check-input me-1">Spawn</label>
-          </div>
         </div>
 
         <ul class="nav nav-tabs mb-3" id="rightTabs" role="tablist">
@@ -368,6 +363,7 @@
                   </div>
                   <div class="col-12 text-end">
                     <button id="runMemBtn" class="btn btn-primary btn-sm mt-2"><i class="bi bi-lightning-fill"></i> 执行模板</button>
+                    <button id="stopMemBtn" class="btn btn-outline-danger btn-sm mt-2 ms-2"><i class="bi bi-stop-fill"></i> 结束模板进程</button>
                   </div>
                 </div>
               </div>
@@ -399,6 +395,7 @@
             </div>
             <div class="d-flex gap-2">
               <button id="runCustomBtn" class="btn btn-success"><i class="bi bi-play-fill"></i> 注入脚本</button>
+              <button id="stopCustomBtn" class="btn btn-outline-danger"><i class="bi bi-stop-fill"></i> 结束脚本进程</button>
               <button id="fillExampleBtn" class="btn btn-outline-secondary">填充示例脚本</button>
             </div>
             <div class="mt-2 text-muted"><small>注：请确保已在设备/模拟器上启动 frida-server，且主机 frida 版本匹配。</small></div>
@@ -444,6 +441,37 @@ const socket = io(); // 使用默认 connect 到同 origin 的 socket.io
 /* ------ 日志缓冲 & 关联（保持你的逻辑） ------ */
 const consoleBuffers = { [GLOBAL_ID]: [] };
 const pidToSession = {};
+let lastTemplatePid = null;
+let lastCustomPid = null;
+
+async function requestFridaExit(pid, scopeLabel, afterSuccess) {
+  if (!pid || pid <= 0) {
+    alert(`${scopeLabel} 当前没有活跃的 Frida CLI 进程`);
+    return;
+  }
+  const token = prompt("如果已设置 ADMIN_TOKEN，请输入（直接回车则空）:") || "";
+  const headers = {"Content-Type":"application/json"};
+  if (token) headers["X-ADMIN-TOKEN"] = token;
+  appendToBuffer(`[frida_exit] 请求退出 ${scopeLabel} PID=${pid}`, currentId || GLOBAL_ID);
+  try {
+    const resp = await fetch(`${API_BASE}/exit_frida_cli`, { method:"POST", headers, body: JSON.stringify({ pid }) });
+    if (resp.ok) {
+      appendToBuffer(`[frida_exit] 已发送 exit 到 PID=${pid}`, currentId || GLOBAL_ID);
+      if (typeof afterSuccess === "function") {
+        try { afterSuccess(); } catch(_) {}
+      }
+    } else {
+      const detail = await resp.text().catch(() => resp.statusText);
+      appendToBuffer(`[frida_exit] 失败: ${detail}`, currentId || GLOBAL_ID);
+      alert(`退出失败: ${detail}`);
+    }
+  } catch (err) {
+    appendToBuffer(`[frida_exit] 异常: ${err}`, currentId || GLOBAL_ID);
+    alert(`退出异常: ${err}`);
+  } finally {
+    renderConsole();
+  }
+}
 function appendToBuffer(line, sid) {
   const id = sid || GLOBAL_ID;
   if (!consoleBuffers[id]) consoleBuffers[id] = [];
@@ -499,7 +527,16 @@ socket.on("frida_log", msg => {
   const line = msg.line || JSON.stringify(msg);
   const sid = pidToSession[msg.pid] || GLOBAL_ID;
   appendToBuffer(line, sid);
-  appendToBuffer(line, GLOBAL_ID);
+  if (sid !== GLOBAL_ID) appendToBuffer(line, GLOBAL_ID);
+  renderConsole();
+});
+socket.on("frida_stopped", info => {
+  const pid = info && typeof info.pid === "number" ? info.pid : null;
+  const exitCode = info && "exit_code" in info ? info.exit_code : "unknown";
+  if (pid && pidToSession[pid]) delete pidToSession[pid];
+  if (pid && pid === lastTemplatePid) lastTemplatePid = null;
+  if (pid && pid === lastCustomPid) lastCustomPid = null;
+  appendToBuffer(`[frida_stopped] pid=${pid} exit=${exitCode}`, GLOBAL_ID);
   renderConsole();
 });
 socket.on("session_new", data => {
@@ -609,52 +646,7 @@ async function viewDetail(id) {
   }
 }
 
-/* ------ 生成/运行脚本 ------ */
-document.getElementById("generateFridaBtn").onclick = async () => {
-  if (!currentId) return alert("先选择一个会话");
-  try {
-    const r = await fetch(`${API_BASE}/generate_frida`, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({id:currentId})});
-    if (r.status === 200) {
-      const script = await r.text();
-      const blob = new Blob([script], {type:"text/javascript"});
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `frida_${currentId}.js`; a.click();
-      URL.revokeObjectURL(a.href);
-    } else {
-      const txt = await r.text().catch(()=>"");
-      alert("生成失败: " + r.status + " " + txt);
-    }
-  } catch (e) {
-    appendToBuffer("[generateFrida] error: " + e, GLOBAL_ID);
-    alert("生成失败: " + e);
-  } finally { renderConsole(); }
-};
-document.getElementById("runFridaBtn").onclick = async () => {
-  if (!currentId) return alert("先选择一个会话");
-  const appName = prompt("请输入目标 App 包名（例如 com.example.app）:");
-  if (!appName) return;
-  const spawn = document.getElementById("spawnCheckbox").checked;
-  const token = prompt("如果已设置 ADMIN_TOKEN，请输入（直接回车则空）:");
-  const headers = {"Content-Type":"application/json"}; if (token) headers["X-ADMIN-TOKEN"] = token;
-  appendToBuffer("[run_frida] 请求注入: " + appName, currentId);
-  try {
-    const r = await fetch(`${API_BASE}/run_frida`, {
-      method:"POST", headers, body: JSON.stringify({id: currentId, app: appName, spawn: spawn})
-    });
-    const j = await r.json().catch(()=>({}));
-    if (r.status === 200 && j.status === "ok") {
-      appendToBuffer("[run_frida] started pid=" + j.pid, currentId);
-      pidToSession[j.pid] = currentId;
-    } else {
-      appendToBuffer("[run_frida] error: " + JSON.stringify(j), currentId);
-      alert("运行失败: " + JSON.stringify(j));
-    }
-  } catch (e) {
-    appendToBuffer("[run_frida] exception: " + e, currentId);
-    alert("运行失败: " + e);
-  } finally { renderConsole(); }
-};
+
 document.getElementById("runMemBtn").onclick = async () => {
   const tpl = document.getElementById("memTemplate").value;
   const cls = document.getElementById("memClassInput").value.trim();
@@ -673,16 +665,25 @@ document.getElementById("runMemBtn").onclick = async () => {
     const j = await r.json().catch(()=>({}));
     if (r.status===200 && j.status==="ok") {
       appendToBuffer("[run_template] started pid=" + j.pid + " template=" + tpl, currentId || GLOBAL_ID);
-      pidToSession[j.pid] = currentId || GLOBAL_ID;
+      if (j.pid && j.pid > 0) {
+        pidToSession[j.pid] = currentId || GLOBAL_ID;
+        lastTemplatePid = j.pid;
+      } else {
+        lastTemplatePid = null;
+      }
     } else {
       appendToBuffer("[run_template] error: " + JSON.stringify(j), currentId || GLOBAL_ID);
       alert("运行失败: " + JSON.stringify(j));
+      lastTemplatePid = null;
     }
   } catch (e) {
     appendToBuffer("[run_template] exception: " + e, currentId || GLOBAL_ID);
     alert("运行失败: " + e);
+    lastTemplatePid = null;
   } finally { renderConsole(); }
 };
+
+document.getElementById("stopMemBtn").onclick = () => requestFridaExit(lastTemplatePid, "模板", () => { lastTemplatePid = null; });
 
 /* ------ Probe ------ */
 document.getElementById("runProbeBtn").onclick = async () => {
@@ -732,16 +733,24 @@ document.getElementById("runCustomBtn").onclick = async () => {
     const j = await r.json().catch(()=>{});
     if (r.status===200 && j && j.status==="ok") {
       appendToBuffer("[run_frida_custom] started pid=" + j.pid, currentId || GLOBAL_ID);
-      pidToSession[j.pid] = currentId || GLOBAL_ID;
+      if (j.pid && j.pid > 0) {
+        pidToSession[j.pid] = currentId || GLOBAL_ID;
+        lastCustomPid = j.pid;
+      } else {
+        lastCustomPid = null;
+      }
     } else {
       appendToBuffer("[run_frida_custom] error: " + JSON.stringify(j), currentId || GLOBAL_ID);
       alert("注入失败: " + JSON.stringify(j));
+      lastCustomPid = null;
     }
   } catch(e){
     appendToBuffer("[run_frida_custom] exception: " + e, currentId || GLOBAL_ID);
     alert("注入异常: " + e);
+    lastCustomPid = null;
   } finally { renderConsole(); }
 };
+document.getElementById("stopCustomBtn").onclick = () => requestFridaExit(lastCustomPid, "自定义脚本", () => { lastCustomPid = null; });
 document.getElementById("fillExampleBtn").onclick = () => {
   const example = `// 示例：打印应用包名 + hook okhttp 请求
 Java.perform(function(){

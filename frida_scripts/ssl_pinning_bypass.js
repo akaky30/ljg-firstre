@@ -1,4 +1,8 @@
 // Enhanced SSL Pinning Bypass (Java + Native/Cronet) - ASCII logs, idempotent, safer return types
+// Optional CA re-pinning support: point CUSTOM_CA_PATH to your mitmproxy/burp certificate in DER form.
+var CUSTOM_CA_PATH = "/data/local/tmp/cert-der.crt";
+var ENABLE_CUSTOM_CA = true;
+
 setImmediate(function () {
   if (globalThis.__frida_bypass_pinning_installed) {
     try { send({ __frida_console: true, args: ["[BYPASS] ALREADY INSTALLED - Script already running"] }); } catch (_) {}
@@ -32,6 +36,98 @@ setImmediate(function () {
       failedHooks: new Set(),
       startTime: Date.now()
     };
+
+    var repinState = {
+      enabled: !!ENABLE_CUSTOM_CA,
+      path: CUSTOM_CA_PATH,
+      loaded: false,
+      error: null,
+      subject: null,
+      trustManagers: null,
+      socketFactory: null,
+      buildingSocket: false
+    };
+
+    var CertificateFactory = null;
+    var FileInputStream = null;
+    var BufferedInputStream = null;
+    var X509Certificate = null;
+    var KeyStore = null;
+    var TrustManagerFactory = null;
+
+    try { CertificateFactory = Java.use("java.security.cert.CertificateFactory"); } catch (_) {}
+    try { FileInputStream = Java.use("java.io.FileInputStream"); } catch (_) {}
+    try { BufferedInputStream = Java.use("java.io.BufferedInputStream"); } catch (_) {}
+    try { X509Certificate = Java.use("java.security.cert.X509Certificate"); } catch (_) {}
+    try { KeyStore = Java.use("java.security.KeyStore"); } catch (_) {}
+    try { TrustManagerFactory = Java.use("javax.net.ssl.TrustManagerFactory"); } catch (_) {}
+
+    function ensureCustomTrustManagers() {
+      if (!repinState.enabled) return null;
+      if (repinState.trustManagers) return repinState.trustManagers;
+      if (!CertificateFactory || !FileInputStream || !BufferedInputStream || !KeyStore || !TrustManagerFactory) {
+        log("[WARN] [REPIN] Required Java classes unavailable; skipping custom CA loading");
+        repinState.error = "Required Java classes unavailable";
+        return null;
+      }
+      try {
+        log("[INFO] [REPIN] Loading custom CA from " + repinState.path);
+        var cf = CertificateFactory.getInstance("X.509");
+        var fileInputStream = FileInputStream.$new(repinState.path);
+        var bufferedInputStream = BufferedInputStream.$new(fileInputStream);
+        var ca = cf.generateCertificate(bufferedInputStream);
+        try { bufferedInputStream.close(); } catch (_) {}
+        try { fileInputStream.close(); } catch (_) {}
+
+        var certInfo = X509Certificate ? Java.cast(ca, X509Certificate) : null;
+        if (certInfo) {
+          repinState.subject = "" + certInfo.getSubjectDN();
+          log("[INFO] [REPIN] Custom CA subject: " + repinState.subject);
+        }
+
+        var keyStoreType = KeyStore.getDefaultType();
+        var keyStore = KeyStore.getInstance(keyStoreType);
+        keyStore.load(null, null);
+        keyStore.setCertificateEntry("frida-custom-ca", ca);
+
+        var tmfAlgorithm = TrustManagerFactory.getDefaultAlgorithm();
+        var tmf = TrustManagerFactory.getInstance(tmfAlgorithm);
+        tmf.init(keyStore);
+        repinState.trustManagers = tmf.getTrustManagers();
+        repinState.loaded = true;
+        log("[OK] [REPIN] TrustManager initialized with custom CA");
+        return repinState.trustManagers;
+      } catch (err) {
+        repinState.error = "" + err;
+        log("[WARN] [REPIN] Failed to load custom CA (" + repinState.path + "): " + err);
+        return null;
+      }
+    }
+
+    function ensureCustomSocketFactory(SSLContext) {
+      if (repinState.socketFactory) return repinState.socketFactory;
+      var tmArray = ensureCustomTrustManagers();
+      if (!tmArray) return null;
+      try {
+        var ctx = SSLContext.getInstance("TLS");
+        repinState.buildingSocket = true;
+        try {
+          ctx.init(null, tmArray, null);
+        } finally {
+          repinState.buildingSocket = false;
+        }
+        repinState.socketFactory = ctx.getSocketFactory();
+        log("[OK] [REPIN] Custom SSLSocketFactory constructed");
+        return repinState.socketFactory;
+      } catch (err) {
+        log("[WARN] [REPIN] Unable to build SSLSocketFactory: " + err);
+        return null;
+      }
+    }
+
+    if (repinState.enabled) {
+      ensureCustomTrustManagers();
+    }
 
     function printBanner() {
       log("================================================");
@@ -133,7 +229,9 @@ setImmediate(function () {
             checkServerTrusted: function (chain, authType) {
               log("[OK] [TRUST_MANAGER_BYPASS] Server certificate check -> ALLOWED");
             },
-            getAcceptedIssuers: function () { return []; }
+            getAcceptedIssuers: function () {
+              return Java.array('Ljava.security.cert.X509Certificate;', []);
+            }
           }
         });
       }
@@ -142,9 +240,16 @@ setImmediate(function () {
         if (ov.__frida_hooked) return;
         ov.__frida_hooked = true;
         ov.implementation = function (km, tm, sr) {
+          if (repinState.buildingSocket) {
+            return ov.call(this, km, tm, sr);
+          }
           state.hookedModules.add('SSLContext.init');
+          var tmArray = ensureCustomTrustManagers();
+          if (tmArray) {
+            log("[OK] [SSL_CONTEXT_REPIN] Replacing TrustManagers with custom CA bundle");
+            return ov.call(this, km, tmArray, sr);
+          }
           log("[OK] [SSL_CONTEXT_BYPASS] TrustManager replaced with TrustAllManager");
-          // Build TM array explicitly to match signature
           var TMArray = Java.array('Ljavax.net.ssl.TrustManager;', [TrustAll.$new()]);
           return ov.call(this, km, TMArray, sr);
         };
@@ -158,6 +263,15 @@ setImmediate(function () {
     // 4) HttpsURLConnection fallback
     try {
       var HUC = Java.use('javax.net.ssl.HttpsURLConnection');
+      try {
+        var customFactory = ensureCustomSocketFactory(SSLContext);
+        if (customFactory) {
+          HUC.setDefaultSSLSocketFactory(customFactory);
+          log("[OK] [REPIN] HttpsURLConnection default SSLSocketFactory set to custom CA");
+        }
+      } catch (e) {
+        log("[WARN] [REPIN] Unable to set default SSLSocketFactory: " + e);
+      }
       if (HUC.setDefaultHostnameVerifier && !HUC.setDefaultHostnameVerifier.__frida_hooked) {
         HUC.setDefaultHostnameVerifier.__frida_hooked = true;
         HUC.setDefaultHostnameVerifier.implementation = function (verifier) {
@@ -321,6 +435,15 @@ setImmediate(function () {
         log("[WARN] No bypass hooks activated yet");
         log("[ADVICE] Trigger HTTPS requests in the app or wait longer");
       }
+      if (repinState.enabled) {
+        if (repinState.loaded) {
+          log("[INFO] [REPIN] Custom CA in use: " + (repinState.subject || repinState.path));
+        } else if (repinState.error) {
+          log("[WARN] [REPIN] Custom CA load failed: " + repinState.error);
+        } else {
+          log("[WARN] [REPIN] Custom CA not yet applied");
+        }
+      }
       if (state.handshakeError) {
         log("[WARN] SSL handshake errors detected - this may indicate system trust issues");
       }
@@ -367,6 +490,13 @@ setImmediate(function () {
         log("4. Root detection / anti-Frida");
         log("[SOLUTION] Enable native hooks (included), trust proxy CA at system level, or use Xposed/objection");
         log("================================================");
+      }
+      if (repinState.enabled) {
+        if (repinState.loaded) {
+          log("[INFO] [REPIN SUMMARY] Custom CA subject: " + (repinState.subject || repinState.path));
+        } else {
+          log("[WARN] [REPIN SUMMARY] Custom CA unusable: " + (repinState.error || "unknown error"));
+        }
       }
     }
 
