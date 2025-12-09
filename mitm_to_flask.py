@@ -23,6 +23,11 @@ API_URL = os.getenv("FLASK_API_URL", f"http://{get_local_ip()}:5000/api/sessions
 POST_INTERVAL = float(os.getenv("MITM_POST_INTERVAL", "0.12"))  # worker 每条之间的间隔 (秒)
 MAX_RETRIES = int(os.getenv("MITM_MAX_RETRIES", "3"))
 REQUEST_TIMEOUT = float(os.getenv("MITM_REQUEST_TIMEOUT", "5.0"))
+API_TOKEN = os.getenv("FLASK_API_TOKEN") or os.getenv("ADMIN_TOKEN") or os.getenv("MITM_API_TOKEN")
+if not API_TOKEN:
+    raise RuntimeError("???? FLASK_API_TOKEN/ADMIN_TOKEN???????? /api/sessions ??")
+AUTH_HEADERS = {"X-ADMIN-TOKEN": API_TOKEN}
+
 
 # ---------- 内部队列与 worker 管理 ----------
 _queue = deque()
@@ -100,7 +105,7 @@ def _worker():
         while attempt < MAX_RETRIES and not success and not _stop_event.is_set():
             attempt += 1
             try:
-                resp = _session.post(API_URL, json=item, timeout=REQUEST_TIMEOUT)
+                resp = _session.post(API_URL, json=item, timeout=REQUEST_TIMEOUT, headers=AUTH_HEADERS)
                 if resp.status_code in (200, 201):
                     print(f"[mitm->flask] post ok (attempt {attempt}) {item.get('method')} {item.get('url')}")
                     success = True

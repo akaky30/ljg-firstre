@@ -2,7 +2,7 @@
 # MITM 会话可视化：Flask + Flask-SocketIO + Frida helpers
 from flask import Flask, request, jsonify, send_file
 from flask_socketio import SocketIO
-import sqlite3, os, uuid, json, subprocess, re, time, csv, traceback, logging, threading
+import sqlite3, os, uuid, json, subprocess, re, time, csv, traceback, logging, threading, hmac
 from io import StringIO
 from functools import wraps
 
@@ -30,8 +30,14 @@ logging.basicConfig(level=logging.INFO,
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# ADMIN_TOKEN 可选保护
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+# ADMIN_TOKEN ???????????
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
+if not ADMIN_TOKEN:
+    raise RuntimeError("ADMIN_TOKEN ??????????????????????")
+
+SESSION_PAYLOAD_LIMIT = int(os.environ.get("SESSION_PAYLOAD_LIMIT", "262144"))  # bytes
+SESSION_BODY_STORE_LIMIT = int(os.environ.get("SESSION_BODY_STORE_LIMIT", "65536"))  # chars
+FRIDA_SCRIPT_LIMIT = int(os.environ.get("FRIDA_SCRIPT_LIMIT", "200000"))  # chars
 
 # ------------------ 工具函数 ------------------
 def safe_load_json(s, default=None):
@@ -43,6 +49,27 @@ def safe_load_json(s, default=None):
         return json.loads(s)
     except Exception:
         return default
+
+def coerce_body_text(body):
+    if body is None:
+        return ""
+    if isinstance(body, str):
+        return body
+    if isinstance(body, (bytes, bytearray)):
+        return body.decode("utf-8", errors="replace")
+    return str(body)
+
+def truncate_text(text: str, limit: int):
+    if not text or limit <= 0 or len(text) <= limit:
+        return text, False, 0
+    extra = len(text) - limit
+    return text[:limit] + f"\n...[truncated {extra} chars]", True, extra
+
+def ensure_script_within_limit(script_text: str, label: str = "script"):
+    if not isinstance(script_text, str):
+        raise ValueError(f"{label} must be string")
+    if len(script_text) > FRIDA_SCRIPT_LIMIT:
+        raise ValueError(f"{label} exceeds limit {FRIDA_SCRIPT_LIMIT} chars (got {len(script_text)})")
 
 def db_conn():
     return sqlite3.connect(DB, timeout=10)
@@ -109,11 +136,9 @@ def detect_sensitive(text: str) -> list:
 def require_token(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        if not ADMIN_TOKEN:
-            return fn(*args, **kwargs)
         token = request.headers.get("X-ADMIN-TOKEN") or request.args.get("token")
-        if token != ADMIN_TOKEN:
-            return jsonify({"error":"unauthorized"}), 401
+        if not token or not hmac.compare_digest(token, ADMIN_TOKEN):
+            return jsonify({"error": "unauthorized"}), 401
         return fn(*args, **kwargs)
     return wrapper
 
@@ -184,8 +209,19 @@ def render_template_external(name: str, params: dict) -> str:
 
 # ------------------ Sessions API ------------------
 @app.route("/api/sessions", methods=["POST"])
+@require_token
 def add_session():
     try:
+        payload_len = request.content_length
+        if payload_len is None:
+            raw_payload = request.get_data(cache=True, as_text=False) or b""
+            payload_len = len(raw_payload)
+        else:
+            request.get_data(cache=True, as_text=False)
+        if payload_len is not None and payload_len > SESSION_PAYLOAD_LIMIT:
+            logging.warning("Rejected session payload size=%s limit=%s", payload_len, SESSION_PAYLOAD_LIMIT)
+            return jsonify({"error": "payload too large", "limit": SESSION_PAYLOAD_LIMIT}), 413
+
         j = request.get_json(force=True, silent=True) or {}
         logging.info("Received POST /api/sessions payload keys: %s", list(j.keys()))
         sid = str(uuid.uuid4())
@@ -193,7 +229,7 @@ def add_session():
         url = j.get("url") or j.get("request_url") or j.get("uri") or ""
         method = j.get("method") or j.get("http_method") or ""
         headers = j.get("headers") or {}
-        body = j.get("body") or ""
+        body = j.get("body")
 
         if isinstance(headers, str):
             parsed = safe_load_json(headers, default={})
@@ -231,9 +267,14 @@ def add_session():
                 normalized_provided.append(str(it))
 
         headers_text = json.dumps(headers_parsed, ensure_ascii=False)
-        body_text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
-        combined = headers_text + "\n" + body_text
+        body_text_for_detection = coerce_body_text(body)
+        combined = headers_text + "\n" + body_text_for_detection
         detected = detect_sensitive(combined)
+
+        body_text = body_text_for_detection
+        body_text, truncated, dropped = truncate_text(body_text, SESSION_BODY_STORE_LIMIT)
+        if truncated:
+            logging.warning("Session %s body truncated to %s chars (dropped %s chars)", sid, SESSION_BODY_STORE_LIMIT, dropped)
 
         merged = normalized_provided + detected
         seen = set(); suspicious_final = []
@@ -720,6 +761,9 @@ def run_frida():
     script_override = data.get("script")
     force_cli = bool(data.get("force_cli", False))
 
+    if script_override is not None and not isinstance(script_override, str):
+        return jsonify({"error": "script must be string"}), 400
+
     if not target_app:
         return jsonify({"error": "Missing target app"}), 400
     if not script_override and not template_name:
@@ -728,9 +772,11 @@ def run_frida():
     # 1) 生成 “用户脚本” （改：从外置模板渲染）
     try:
         if script_override:
+            ensure_script_within_limit(script_override, "script_override")
             user_js = script_override
         else:
             user_js = render_template_external(template_name, params)
+            ensure_script_within_limit(user_js, "rendered script")
     except Exception as e:
         logging.error("prepare script failed: %s", traceback.format_exc())
         return jsonify({"error":"prepare script failed", "detail": str(e)}), 400
@@ -872,8 +918,10 @@ def run_frida_custom():
         return jsonify({"error":"Missing target app"}), 400
     if not script_text or not isinstance(script_text, str):
         return jsonify({"error":"Missing script"}), 400
-    if len(script_text) > 200_000:
-        return jsonify({"error":"script too large"}), 400
+    try:
+        ensure_script_within_limit(script_text, "script")
+    except ValueError as e:
+        return jsonify({"error":"script too large", "detail": str(e)}), 400
 
     script_name = f"frida_custom_{int(time.time())}_{uuid.uuid4().hex[:8]}.js"
     script_path = os.path.join(FRIDA_DIR, script_name)
@@ -966,6 +1014,7 @@ def inject_frida():
     # 渲染模板（改：外置）
     try:
         user_script = render_template_external(template_name, params)
+        ensure_script_within_limit(user_script, "rendered script")
     except Exception as e:
         return jsonify({"error": "template render failed", "detail": str(e)}), 400
 
